@@ -32,10 +32,10 @@ RUN install2.r --error --skipinstalled \
       yaml \
       rentrez \
       europepmc \
-      openalexR \
       httr2 \
       jsonlite \
       DBI \
+      filelock \
       RSQLite \
       stringdist \
       blastula \
@@ -51,6 +51,7 @@ WORKDIR /app
 # Copy the pipeline code (configs + db + digests come from volumes)
 COPY R/ ./R/
 COPY web/decrypt_key.py ./web/decrypt_key.py
+COPY scripts/write_cron_env.py ./scripts/write_cron_env.py
 COPY config/ ./config/
 COPY entrypoint.sh ./entrypoint.sh
 COPY crontab.template ./crontab.template

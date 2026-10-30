@@ -188,59 +188,7 @@
 # Generic runner — used by fetch_signals when a provider is enabled
 # ============================================================
 fetch_pharma_intel <- function(provider_key, q, days_back, settings) {
-  prov <- .PHARMA_PROVIDERS[[provider_key]]
-  if (is.null(prov)) return(.empty_signals())
-
-  # Credentials: decrypted per-question key for this provider. Expected to be
-  # a small JSON blob, e.g. {"client_id":"..","client_secret":".."} or
-  # {"api_key":".."}. Parse leniently.
-  raw_key <- settings$signal_keys[[provider_key]] %||% ""
-  if (!nzchar(raw_key)) {
-    message(sprintf("  [signals] %s enabled but no credentials; skipping",
-                    prov$label))
-    return(.empty_signals())
-  }
-  creds <- tryCatch(jsonlite::fromJSON(raw_key), error = function(e) list())
-  if (is.character(creds)) creds <- list(api_key = creds)  # bare key string
-
-  # 1. auth
-  auth_fn <- get(prov$auth_fn)
-  token <- auth_fn(prov, creds)
-  if (!nzchar(token)) {
-    message(sprintf("  [signals] %s auth failed; skipping", prov$label))
-    return(.empty_signals())
-  }
-
-  # 2. request
-  req_fn <- get(prov$req_fn)
-  spec <- req_fn(prov, q, token, days_back)
-  if (is.null(spec)) return(.empty_signals())
-
-  resp <- tryCatch({
-    rq <- httr2::request(spec$url) |>
-      httr2::req_url_query(!!!spec$query) |>
-      httr2::req_retry(max_tries = 3)
-    # splice all headers at once (robust across httr2 versions)
-    if (length(spec$headers))
-      rq <- do.call(httr2::req_headers, c(list(rq), spec$headers))
-    httr2::req_perform(rq)
-  }, error = function(e) {
-    message(sprintf("  [signals] %s request failed: %s", prov$label,
-                    conditionMessage(e)))
-    NULL
-  })
-  if (is.null(resp)) return(.empty_signals())
-
-  # 3. parse
-  js <- tryCatch(httr2::resp_body_json(resp), error = function(e) NULL)
-  if (is.null(js)) return(.empty_signals())
-  parse_fn <- get(prov$parse_fn)
-  out <- tryCatch(parse_fn(js, prov), error = function(e) {
-    message(sprintf("  [signals] %s parse failed: %s", prov$label,
-                    conditionMessage(e)))
-    .empty_signals()
-  })
-  # TODO[access]: handle pagination here once the response's paging shape is
-  # known (cursor / offset / nextUrl). The scaffold fetches page 1 only.
-  out
+  # Contract-specific endpoints above are design notes, not verified clients.
+  # Never send stored credentials to placeholder domains or report success.
+  stop("Commercial pharma adapters are not implemented; verified contract-specific integration is required")
 }

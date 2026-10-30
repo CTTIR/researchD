@@ -30,6 +30,9 @@ run "date parsing"               dev/tests/Rrun.sh dev/tests/parse_date.R
 run "classifier edge cases"      dev/tests/Rrun.sh dev/tests/classify_table.R
 run "dedup and ranking"          dev/tests/Rrun.sh dev/tests/dedup_rank.R
 run "fetch plumbing + decrypt"   dev/tests/Rrun.sh dev/tests/fetch_plumbing.R
+run "engine hardening"          dev/tests/Rrun.sh dev/tests/hardening_engine.R
+run "Zotero failure and retry"  dev/tests/Rrun.sh dev/tests/hardening_delivery.R
+run "nullable delivery metadata" dev/tests/Rrun.sh dev/tests/hardening_engine_delivery.R
 
 echo
 echo "── database ──────────────────────────────────────"
@@ -45,6 +48,12 @@ run "scheduler: cadence, sends"  $PY dev/tests/scheduler_phase5.py
 run "integration: all services"  $PY dev/tests/integration_phase6.py
 run "security: adversarial"      $PY dev/tests/security_phase7.py
 run "ops: restart, backup, prune" $PY dev/tests/ops_phase8.py
+run "web security regressions"   $PY dev/tests/hardening_web.py
+run "scheduler regressions"      $PY dev/tests/hardening_scheduler.py
+run "dashboard DOM"              node dev/tests/hardening_web_dom.js
+run "cron environment handoff"   $PY dev/tests/hardening_cron.py
+run "real pipeline entrypoint"   $PY dev/tests/hardening_entrypoint.py
+run "delivery-aware retention"   $PY dev/tests/hardening_retention.py
 
 echo
 echo "── audit probes ──────────────────────────────────"

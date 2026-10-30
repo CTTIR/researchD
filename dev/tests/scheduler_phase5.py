@@ -123,7 +123,7 @@ if SENT:
     check("the subject carries the new-record count", "3 papers" in m["subject"], m["subject"])
     check("HTML is grouped by study type with the right headings",
           "Randomized controlled trials (2)" in m["html"]
-          and "Systematic reviews &amp; meta-analyses" in m["html"].replace("&", "&amp;"),
+          and "Systematic reviews & meta-analyses" in __import__("html").unescape(m["html"]),
           m["html"][:300])
     check("systematic reviews are rendered before RCTs (evidence order)",
           m["html"].index("Systematic reviews") < m["html"].index("Randomized controlled"))

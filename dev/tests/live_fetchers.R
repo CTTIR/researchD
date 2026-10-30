@@ -1,13 +1,15 @@
 # ============================================================
-# Phase 3 step 5 — external call sites, verified for real.
+# Opt-in probes of external call sites; skipped sources remain unverified.
 #
 # Two layers:
 #   A) argument names checked against the INSTALLED package signatures
 #   B) each fetcher run LIVE against the real API with a tiny query,
 #      asserting the normalized record schema comes back
 #
-# Deliberately polite: narrow date windows, one call per source, and no
-# contact email is transmitted (mailto/polite-pool is optional everywhere).
+# Narrow date windows limit load, but adapters can make multiple paginated
+# requests and consume provider quota. This probe does not supply contact
+# addresses; provider restrictions/authentication can prevent a live check.
+# OpenAlex needs a key for cursor pagination; OPENALEX_API_KEY is supported.
 # Set RESEARCHR_SKIP_LIVE=1 to run only layer A.
 # ============================================================
 source("R/00_utils.R")
@@ -38,9 +40,8 @@ ok("rentrez::set_entrez_key exists", is.function(rentrez::set_entrez_key))
 ok("europepmc::epmc_search accepts query/limit/verbose",
    has_args(europepmc::epmc_search, c("query","limit","verbose")),
    paste(names(formals(europepmc::epmc_search)), collapse=","))
-ok("openalexR::oa_fetch accepts entity/options/mailto/verbose",
-   has_args(openalexR::oa_fetch, c("entity")),
-   paste(names(formals(openalexR::oa_fetch)), collapse=","))
+ok("native OpenAlex fetcher accepts concept terms and settings",
+   has_args(fetch_openalex, c("concept_terms", "days_back", "settings")))
 
 if (nzchar(Sys.getenv("RESEARCHR_SKIP_LIVE"))) {
   cat("\nLive calls skipped (RESEARCHR_SKIP_LIVE set)\n")
@@ -57,10 +58,10 @@ settings <- list(
 
 # This suite asks "does OUR adapter map the live response into our schema
 # correctly". An upstream outage is not an answer to that question, so it is
-# reported as a SKIP with the message rather than a FAIL -- otherwise a bad
-# afternoon at EBI or NCBI reads as a defect in this repository. Production
-# already degrades correctly: every fetcher is .safe()-wrapped, and since the
-# fetch_log fix a failure is recorded as ok=0 rather than as an empty success.
+# reported as a SKIP with the message rather than a FAIL. A skip does not
+# verify the adapter, and a schema check does not establish complete recall.
+# Production records source failures/incompleteness in fetch_log; a failed
+# source must not be confused with a successful search returning no rows.
 check_frame <- function(label, df, require_rows = TRUE) {
   if (inherits(df, "error")) {
     skip(paste(label, "(upstream)"), conditionMessage(df)); return(invisible())
@@ -100,7 +101,7 @@ if (is.data.frame(r) && nrow(r)) {
      paste(sum(nzchar(r$type)), "of", nrow(r)))
 }
 
-cat("\n  OpenAlex (openalexR)\n")
+cat("\n  OpenAlex (native httr2 API)\n")
 r <- tryCatch(fetch_openalex(list(c("semaglutide"), c("steatohepatitis")), 120, settings),
               error = function(e) e)
 check_frame("openalex", r, require_rows = FALSE)

@@ -15,9 +15,9 @@
 #   records   pruned by first_seen older than <record-months> (default 24).
 #             Pruning a record makes it eligible to be "new" again if the
 #             same paper resurfaces in a later fetch window -- the dedup key
-#             lives in this table and nowhere else. 24 months is well past
-#             any question's lookback, so in practice that cannot happen;
-#             shorten it only if you understand that trade-off.
+#             lives in this table and nowhere else. A source can re-index old
+#             material, so rediscovery is possible even with a short lookback.
+#             Records with unfinished file/Zotero deliveries are retained.
 #   signals   same treatment, same reasoning.
 #   fetch_log capped at the most recent 5000 rows. It is pure telemetry.
 #   digests   the newest <digest-keep> HTML and Markdown files are kept.
@@ -32,31 +32,62 @@ DIGESTS="${2:?usage: prune.sh <db-path> <digests-dir> [record-months] [digest-ke
 MONTHS="${3:-24}"
 KEEP="${4:-60}"
 
-[ -f "$DB" ] || { echo "prune.sh: no such database: $DB" >&2; exit 1; }
+python3 - "$DB" "$DIGESTS" "$MONTHS" "$KEEP" <<'PY'
+from pathlib import Path
+import re
+import sqlite3
+import sys
 
-python3 - "$DB" "$MONTHS" <<'PY'
-import sqlite3, sys
-db, months = sys.argv[1], int(sys.argv[2])
-con = sqlite3.connect(db, timeout=30)
-con.execute("PRAGMA busy_timeout=30000;")
-cutoff = f"-{months} months"
-r = con.execute("DELETE FROM records WHERE first_seen < datetime('now', ?)", (cutoff,))
-n_rec = r.rowcount
-r = con.execute("DELETE FROM signals WHERE first_seen < datetime('now', ?)", (cutoff,))
-n_sig = r.rowcount
-r = con.execute("DELETE FROM fetch_log WHERE id NOT IN "
-                "(SELECT id FROM fetch_log ORDER BY id DESC LIMIT 5000)")
-n_log = r.rowcount
-con.commit()
-con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-con.close()
+def positive_integer(value, name):
+    if not re.fullmatch(r"[0-9]+", value) or int(value) < 1:
+        raise SystemExit(f"prune.sh: {name} must be a positive integer")
+    return int(value)
+
+# Validate the entire request before touching either records or files.
+months = positive_integer(sys.argv[3], "record-months")
+keep = positive_integer(sys.argv[4], "digest-keep")
+db = Path(sys.argv[1]).resolve()
+digests = Path(sys.argv[2])
+if not db.is_file():
+    raise SystemExit(f"prune.sh: no such database: {db}")
+if digests.exists() and not digests.is_dir():
+    raise SystemExit(f"prune.sh: digest path is not a directory: {digests}")
+old_files = []
+if digests.is_dir():
+    for suffix in (".html", ".md", ".log"):
+        files = [p for p in digests.iterdir()
+                 if p.is_file() and p.suffix == suffix and p.resolve() != db]
+        files.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+        old_files.extend(files[keep:])
+
+con = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=30)
+try:
+    con.execute("PRAGMA busy_timeout=30000;")
+    con.execute("PRAGMA foreign_keys=ON;")
+    with con:
+        con.execute("BEGIN IMMEDIATE")
+        cutoff = f"-{months} months"
+        has_outbox = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_outbox'").fetchone()
+        # Retry payloads are state. Completed entries cascade with their expired
+        # records; unfinished entries, including any future retry state, remain.
+        pending_guard = (" AND NOT EXISTS (SELECT 1 FROM delivery_outbox d WHERE "
+                         "d.question_id=records.question_id AND d.dedup_key=records.dedup_key "
+                         "AND d.state<>'sent')") if has_outbox else ""
+        n_rec = con.execute("DELETE FROM records WHERE first_seen < datetime('now', ?)" + pending_guard,
+                            (cutoff,)).rowcount
+        n_sig = con.execute("DELETE FROM signals WHERE first_seen < datetime('now', ?)", (cutoff,)).rowcount
+        n_log = con.execute("DELETE FROM fetch_log WHERE id NOT IN "
+                            "(SELECT id FROM fetch_log ORDER BY id DESC LIMIT 5000)").rowcount
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+finally:
+    con.close()
+
+# Pass whole paths to the filesystem, never through whitespace-delimited shell
+# output. Spaces, quotes and newlines in a directory or filename are literal.
+for path in old_files:
+    path.unlink(missing_ok=True)
 print(f"pruned {n_rec} record(s), {n_sig} signal(s), {n_log} fetch_log row(s) "
       f"older than {months} months")
+if digests.is_dir():
+    print(f"digests: kept the newest {keep} of each type in {digests}")
 PY
-
-if [ -d "$DIGESTS" ]; then
-  for ext in html md log; do
-    ls -1t "$DIGESTS"/*."$ext" 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm --
-  done
-  echo "digests: kept the newest $KEEP of each type in $DIGESTS"
-fi

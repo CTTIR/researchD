@@ -1,15 +1,21 @@
 # ============================================================
 # GLOBAL SETTINGS
-# Secrets (passwords, API keys) should ideally come from
-# environment variables, not be committed here. Placeholders
-# below read from env first, fall back to the literal value.
+# Keep secrets out of committed configuration. Prefer encrypted per-question
+# keys in the dashboard; explicit environment fallbacks are noted below.
 # ============================================================
 
 paths:
   db: "db/pipeline.sqlite"
   digests: "digests"
 
-# Toggle sources on/off. All are free.
+# Per-source fetch bound. Reaching a cap is recorded as incomplete in source
+# health, not as an exhaustive search. Upstream APIs may impose lower limits.
+# bioRxiv/medRxiv applies this bound to scanned rows before keyword filtering.
+# Positive integers only; values above 100000 are capped at 100000.
+fetch:
+  max_records: 5000
+
+# Toggle sources on/off. Some APIs require a key for usable quotas/pagination.
 sources:
   pubmed: true
   europepmc: true
@@ -24,6 +30,11 @@ sources:
 ncbi:
   email: "you@example.com"        # required by NCBI etiquette
   api_key: ""                      # optional but recommended; or set ENTREZ_KEY env var
+
+# OpenAlex: key required for cursor pagination. Prefer the question's
+# encrypted openalex key; OPENALEX_API_KEY is the global environment fallback.
+openalex:
+  api_key: ""
 
 # Semantic Scholar: works keyless, but a free key raises the rate limit.
 # Request one at https://www.semanticscholar.org/product/api
@@ -52,7 +63,9 @@ ranking:
     biorxiv: 1
     openalex: 1
 
-# ---- Email delivery (uses the `blastula` package + SMTP) ----
+# ---- Legacy direct email helper (`blastula`) ----
+# Normal service email uses .env SMTP settings and per-question recipients/
+# email_cron in the scheduler. This block does not configure that service.
 # For your own SMTP server: 587 = STARTTLS (tls=true), 465 = implicit SSL
 # (ssl=true). Set whichever your server uses.
 email:

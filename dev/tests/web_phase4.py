@@ -274,7 +274,7 @@ rec = anon.get("/api/v1/records", headers=AUTH, params={"question_id": "glp1_mas
 check("/records returns every stored record", rec["total"] == 4, str(rec["total"]))
 check("/records rows carry the full column set",
       set(rec["records"][0]) == set(["dedup_key", "question_id", "source", "ext_id", "doi",
-          "title", "abstract", "authors", "journal", "pub_date", "url", "oa_url", "type",
+          "title", "abstract", "authors", "journal", "pub_date", "url", "oa_url", "provenance", "type",
           "study_type", "is_preprint", "score", "first_seen", "emailed"]),
       json.dumps(sorted(rec["records"][0])))
 r = anon.get("/api/v1/records", headers=AUTH, params={"question_id": "glp1_mash", "study_type": "rct"}).json()

@@ -7,7 +7,9 @@
 # ============================================================
 
 .norm_extid <- function(x) {
-  x <- tolower(trimws(x %||% ""))
+  if (is.null(x)) return("")
+  x <- as.character(x); x[is.na(x)] <- ""
+  x <- tolower(trimws(x))
   gsub("[^a-z0-9]", "", x)
 }
 
@@ -38,20 +40,24 @@
 
 rank_signals <- function(sig, q, settings) {
   if (nrow(sig) == 0) { sig$score <- numeric(0); return(sig) }
-  terms <- tolower(unique(unlist(lapply(q$concepts, function(c) c(c$terms, c$mesh)))))
+  terms <- tolower(.signal_terms(q))
   txt <- tolower(paste(sig$title, sig$summary))
   rel <- vapply(txt, function(t)
     sum(vapply(terms, function(tm) grepl(tm, t, fixed = TRUE), logical(1))) /
       max(length(terms), 1), numeric(1))
 
-  d <- suppressWarnings(as.Date(sig$signal_date))
-  span <- max(as.numeric(Sys.Date() - min(d, na.rm = TRUE)), 1)
+  d <- .parse_date(sig$signal_date)
+  sig$signal_date <- as.character(d)
+  oldest <- suppressWarnings(min(d, na.rm = TRUE))
+  span <- if (!is.finite(as.numeric(oldest))) 1 else max(as.numeric(Sys.Date() - oldest), 1)
   recency <- 1 - (as.numeric(Sys.Date() - d) / span)
-  recency[is.na(recency)] <- 0.5
+  recency[!is.finite(recency)] <- 0
+  recency <- pmax(0, pmin(1, recency))
 
   conf <- vapply(sig$confidence, .confidence_weight, numeric(1))
-  tprio <- vapply(sig$signal_type, function(t)
-    (.SIGNAL_TYPE_PRIORITY[[t]] %||% 1) / 5, numeric(1))
+  tprio <- unname(.SIGNAL_TYPE_PRIORITY[sig$signal_type])
+  tprio[is.na(tprio)] <- 1
+  tprio <- tprio / 5
 
   sig$score <- 2.0 * rel + 1.0 * recency + 1.5 * conf + 1.0 * tprio
   sig[order(-sig$score), , drop = FALSE]
@@ -60,23 +66,63 @@ rank_signals <- function(sig, q, settings) {
 # Persist new signals; return only genuinely new ones.
 persist_signals <- function(con, sig, question_id) {
   if (nrow(sig) == 0) return(sig)
-  sig$dedup_key <- paste0(sig$source, ":", .norm_extid(sig$ext_id))
-  sig <- sig[!duplicated(sig$dedup_key), , drop = FALSE]
-  existing <- DBI::dbGetQuery(con,
-    "SELECT dedup_key FROM signals WHERE question_id = ?",
-    params = list(question_id))$dedup_key
-  new <- sig[!(sig$dedup_key %in% existing), , drop = FALSE]
-  if (nrow(new) == 0) return(new)
-  ins <- data.frame(
-    dedup_key = new$dedup_key, question_id = question_id,
-    signal_type = new$signal_type, source = new$source, ext_id = new$ext_id,
-    title = new$title, summary = new$summary, org = new$org,
-    signal_date = as.character(new$signal_date), url = new$url,
-    confidence = new$confidence, extra = new$extra,
-    score = new$score %||% 0, stringsAsFactors = FALSE
-  )
-  DBI::dbWriteTable(con, "signals", ins, append = TRUE)
-  new
+  sig$signal_date <- as.character(.parse_date(sig$signal_date))
+  # Stable identifiers are essential: a blank key would collapse unrelated
+  # signals from the same source. A URL is an acceptable source identifier.
+  missing <- is.na(sig$ext_id) | !nzchar(sig$ext_id)
+  sig$ext_id[missing] <- sig$url[missing]
+  if (any(is.na(sig$ext_id) | !nzchar(sig$ext_id)))
+    stop("A signal has neither an external identifier nor a URL")
+  fields <- c("source", "ext_id", "signal_type", "title", "summary", "org",
+              "signal_date", "url", "confidence", "extra")
+  value <- function(row, field) {
+    x <- row[[field]][1]
+    if (is.null(x) || is.na(x)) "" else as.character(x)
+  }
+  canonical_extra <- function(text) {
+    sort_objects <- function(x) {
+      if (!is.list(x)) return(x)
+      if (!is.null(names(x))) x <- x[order(names(x))]
+      lapply(x, sort_objects)
+    }
+    tryCatch(sort_objects(jsonlite::fromJSON(text, simplifyVector = FALSE)), error = function(e) text)
+  }
+  same <- function(left, right) all(vapply(fields, function(field) {
+    if (field == "extra") return(isTRUE(all.equal(canonical_extra(value(left, field)),
+      canonical_extra(value(right, field)), tolerance = 0)))
+    identical(value(left, field), value(right, field))
+  }, logical(1)))
+  DBI::dbExecute(con, "BEGIN IMMEDIATE")
+  committed <- FALSE
+  on.exit(if (!committed) DBI::dbRollback(con), add = TRUE)
+  added <- list()
+  for (i in seq_len(nrow(sig))) {
+    row <- sig[i, , drop = FALSE]
+    base <- paste0(row$source, ":", .norm_extid(row$ext_id))
+    prefix <- paste0(base, ":revision:")
+    prior <- DBI::dbGetQuery(con,
+      "SELECT * FROM signals WHERE question_id=? AND (dedup_key=? OR substr(dedup_key,1,?)=?)",
+      params = list(question_id, base, nchar(prefix), prefix))
+    if (nrow(prior) && any(vapply(seq_len(nrow(prior)),
+        function(j) same(row, prior[j, , drop = FALSE]), logical(1)))) next
+    key <- base
+    revision <- 0L
+    while (key %in% prior$dedup_key) {
+      revision <- revision + 1L
+      key <- paste0(prefix, revision)
+    }
+    row$dedup_key <- key
+    ins <- data.frame(dedup_key = key, question_id = question_id,
+      signal_type = row$signal_type, source = row$source, ext_id = row$ext_id,
+      title = row$title, summary = row$summary, org = row$org,
+      signal_date = row$signal_date, url = row$url, confidence = row$confidence,
+      extra = row$extra, score = row$score %||% 0, stringsAsFactors = FALSE)
+    DBI::dbWriteTable(con, "signals", ins, append = TRUE)
+    added[[length(added) + 1L]] <- row
+  }
+  DBI::dbCommit(con); committed <- TRUE
+  if (!length(added)) return(sig[0, , drop = FALSE])
+  do.call(rbind, added)
 }
 
 # Load per-question signal config from the DB (toggles, targets, keys).
@@ -88,8 +134,7 @@ load_signal_config <- function(con, question_id) {
     return(list(sources = list(), min_confidence = "unverified",
                 scrape_targets = list(), api_keys = list()))
   }
-  keys_enc <- tryCatch(jsonlite::fromJSON(row$api_keys_enc %||% "{}"),
-                       error = function(e) list())
+  keys_enc <- .read_config_json(row$api_keys_enc, "signal_config.api_keys_enc", "{}")
   list(
     sources = tryCatch(jsonlite::fromJSON(row$sources %||% "{}"),
                        error = function(e) list()),

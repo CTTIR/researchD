@@ -20,3 +20,12 @@ dev/audit/
 dev/N8N_INTEGRATION.md
 dev/ARCHITECTURE.md
 dev/ACCESS_AUDIT.md
+
+# Dependency caches, additional secret files, and SQLite recovery state
+.env.*
+.venv/
+**/__pycache__/
+**/*.pyc
+db/*.sqlite*
+db/*.pipeline.lock
+db/*.replaced-*

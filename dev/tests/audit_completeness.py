@@ -55,8 +55,8 @@ check("DB_PATH is supplied by compose even though it is not user-facing",
 # ------------------------------------------------- 4/5. deps vs Dockerfiles
 print("\n4/5. declared dependencies vs what the code imports")
 STDLIB = set(sys.stdlib_module_names)
-webdeps = (ROOT / "Dockerfile.web").read_text()
-schdeps = (ROOT / "Dockerfile.scheduler").read_text()
+webdeps = (ROOT / "Dockerfile.web").read_text() + (ROOT / "requirements-web.txt").read_text()
+schdeps = (ROOT / "Dockerfile.scheduler").read_text() + (ROOT / "requirements-scheduler.txt").read_text()
 
 def third_party(path):
     mods = set()

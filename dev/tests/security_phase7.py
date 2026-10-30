@@ -204,8 +204,11 @@ res = subprocess.run([str(ROOT / "dev" / "tests" / "Rrun.sh"), "-e",
     'cat("[", .decrypt_key(commandArgs(TRUE)[1]), "]\\n", sep="")',
     "--args", enc["pubmed"]], cwd=ROOT, capture_output=True, text=True,
     env=dict(os.environ, APP_SECRET_KEY=Fernet.generate_key().decode()))
-check("the R engine also degrades to empty on a wrong key",
-      "[]" in res.stdout, (res.stdout + res.stderr).strip()[-200:])
+check("the R engine fails visibly instead of silently dropping a configured key",
+      res.returncode != 0 and "Cannot decrypt configured API key" in res.stderr,
+      (res.stdout + res.stderr).strip()[-200:])
+check("the R decryption diagnostic contains no key material",
+      all(value not in res.stdout + res.stderr for value in (enc["pubmed"], KEY, SECRET_KEY_VALUE)))
 
 # ------------------------------------------------------- 4. cookies/transport
 print("\n4. cookie flags")

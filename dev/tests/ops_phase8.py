@@ -43,7 +43,8 @@ c.post("/api/questions", json={
 con = sqlite3.connect(DB)
 con.execute("INSERT INTO records(dedup_key,question_id,title,study_type,pub_date,score,emailed)"
             " VALUES('r1','q1','T','rct','2026-08-01',5.0,0)")
-LAST_SENT = (datetime.now().astimezone() - timedelta(hours=1)).isoformat()
+FIXED_NOW = datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc)
+LAST_SENT = (FIXED_NOW - timedelta(hours=1)).isoformat()
 con.execute("UPDATE questions SET email_last_sent=? WHERE id='q1'", (LAST_SENT,))
 con.commit(); con.close()
 
@@ -52,6 +53,7 @@ for mod in [m for m in list(sys.modules) if m.startswith("web.")]:
     del sys.modules[mod]
 import web.app as appmod2
 from web import scheduler as sch2
+sch2.now_local = lambda: FIXED_NOW
 c2 = TestClient(appmod2.app, follow_redirects=False)
 
 check("the database file survived the cycle", DB.exists())
@@ -79,7 +81,7 @@ check("the scheduler does NOT re-blast on restart (it respects email_last_sent)"
       len(SENT) == 0, str(SENT))
 con = sqlite3.connect(DB)
 con.execute("UPDATE questions SET email_last_sent=? WHERE id='q1'",
-            ((datetime.now().astimezone() - timedelta(days=2)).isoformat(),))
+            ((FIXED_NOW - timedelta(days=2)).isoformat(),))
 con.commit(); con.close()
 sch2.run_once()
 check("...and does send once genuinely due again", len(SENT) == 1, str(SENT))
@@ -194,9 +196,25 @@ check("a fetcher error degrades only that source (.safe wrapper)",
 check("one question failing does not abort the run", "n_failed <<- n_failed + 1L" in runsrc)
 check("an unloadable question is skipped, not fatal",
       "skipping unloadable question" in (ROOT / "R" / "07_db_questions.R").read_text())
-sch_run = schsrc[schsrc.index("def run_once"):]
-check("records are marked emailed ONLY inside the successful-send branch",
-      sch_run.index("if send_email(") < sch_run.index("UPDATE records SET emailed=1"))
+con = sqlite3.connect(DB)
+con.execute("INSERT INTO questions(id,label,email_enabled,email_cron,email_to,email_last_sent)"
+            " VALUES('failure','Failure',1,'* * * * *','[\"x@example.org\"]',?)",
+            ((FIXED_NOW-timedelta(days=1)).isoformat(),))
+con.execute("INSERT INTO records(dedup_key,question_id,title,study_type,emailed)"
+            " VALUES('pending','failure','Pending','unclassified',0)")
+con.commit(); con.close()
+sch2.send_email = lambda *args: False
+sch2.run_once()
+con = sqlite3.connect(DB)
+check("a failed send leaves the actual record pending",
+      con.execute("SELECT emailed FROM records WHERE dedup_key='pending'").fetchone()[0] == 0)
+con.close()
+sch2.send_email = lambda *args: True
+sch2.run_once()
+con = sqlite3.connect(DB)
+check("a successful retry acknowledges the actual record",
+      con.execute("SELECT emailed FROM records WHERE dedup_key='pending'").fetchone()[0] == 1)
+con.close()
 check("a scheduler loop error is caught so the service stays up",
       "loop error" in schsrc)
 
@@ -228,10 +246,15 @@ for topic, needle in [
 # --------------------------------------------------- 7. dependency posture
 print("\n7. dependency pins")
 text = (ROOT / "Dockerfile.web").read_text() + (ROOT / "Dockerfile.scheduler").read_text()
-specs = re.findall(r'"([a-zA-Z0-9_.-]+)(?:\[[^\]]*\])?(>=[^"]+)"', text)
-check("every pip requirement now has an upper bound",
-      all("<" in spec for _, spec in specs),
-      str([n for n, s in specs if "<" not in s]))
+specs = []
+for manifest in ("requirements-web.txt", "requirements-scheduler.txt"):
+    for line in (ROOT / manifest).read_text().splitlines():
+        if line and not line.startswith(("#", "-")):
+            from packaging.requirements import Requirement
+            req = Requirement(line)
+            specs.append((req.name, str(req.specifier)))
+check("deployment dependencies are explicitly version-pinned", bool(specs) and
+      all(spec.startswith("==") and "*" not in spec for _, spec in specs))
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 out = []
@@ -239,10 +262,9 @@ for name, spec in specs:
     try:
         if Version(md.version(name)) not in SpecifierSet(spec):
             out.append(f"{name} {md.version(name)} !~ {spec}")
-    except Exception:
-        pass
-check("the versions this build was verified against satisfy those pins",
-      not out, "; ".join(out))
+    except md.PackageNotFoundError:
+        out.append(f"{name} is missing")
+check("installed dependency versions satisfy the deployment pins", not out, "; ".join(out))
 check("no base image floats on :latest",
       not re.search(r"^FROM\s+\S+:latest", text + (ROOT / "Dockerfile").read_text(), re.M))
 

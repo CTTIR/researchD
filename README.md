@@ -1,348 +1,322 @@
 # researchd
 
-Self-hosted literature and signal surveillance. Watches the free biomedical
-databases on a schedule, deduplicates and classifies everything it finds, and
-delivers it as RSS feeds, email digests and Zotero pushes.
+Self-hosted literature and signal surveillance for research teams. Define a
+question, retrieve overlapping sources on a schedule, inspect ranked results,
+and deliver them through RSS, email, local digest files or Zotero.
 
-This is the **server** half of a pair.
-[**researchR**](https://github.com/CTTIR/researchR) is the client: an R
-package that drives this service over its REST API, so questions can be
-defined and results pulled into tibbles from R instead of the browser.
+This is the **server**. [**researchR**](https://github.com/CTTIR/researchR)
+is its R client for defining questions and retrieving typed tibbles through
+the token-authenticated REST API.
 
-```r
-remotes::install_github("CTTIR/researchR")
-```
+**Development software for academic research.** Search coverage, source access
+and classification accuracy vary. Results need human review; this is not a
+validated systematic-review search or a clinical decision system. The
+[maintenance record](docs/maintenance-2026-10-30.md) documents the audit,
+repairs, verification evidence and remaining release work.
 
-**Development software for academic research.** Source results require review;
-coverage and upstream availability vary. See the executable checks below.
+## Sources and coverage
 
----
+| Track | Implemented sources | Important limits |
+|---|---|---|
+| Literature | PubMed, Europe PMC, OpenAlex, Crossref, Semantic Scholar, ClinicalTrials.gov, bioRxiv/medRxiv | Access limits and date/query semantics differ. PubMed supplies titles and publication types but not abstracts; overlapping sources can fill missing metadata. |
+| Signals | NIH RePORTER, native ClinicalTrials.gov registrations and posted results, openFDA, SEC filings, PatentSearch, configured RSS and scrape targets | A registry or agency source is authoritative about provenance, not evidence quality. FDA label dates are not approval dates. |
+| Registry leads | CTIS and ISRCTN through optional `ctrdata` | Lead records, without reliable registration/result event dating; live behavior has not been verified in this maintenance pass. |
+| Unavailable adapters | EPO, Cortellis, Citeline | Selecting these reports an unavailable source; it does not provide commercial-database coverage. |
 
-## What it watches
+OpenAlex uses the native HTTP API. An API key is required for cursor
+pagination; configure one in the question's encrypted API keys. See the
+[OpenAlex paging documentation](https://help.openalex.org/api/paging/).
+PatentSearch requires a PatentsView key; its adapter uses the current
+`X-Api-Key` header. Semantic Scholar may rate-limit keyless access. Sources
+requiring registration or subscription are not made accessible by installing
+researchd. WHO ICTRP and comprehensive worldwide trial-registry coverage are
+outside the present scope.
 
-**Literature** — PubMed, Europe PMC, OpenAlex, Crossref, Semantic Scholar,
-ClinicalTrials.gov, bioRxiv/medRxiv. Unpaywall enriches each DOI with a legal
-open-access link where one exists.
+`config/settings.yaml` sets `fetch.max_records` (default 5000; values above
+100000 are capped). Fetches have additional upstream limits: PubMed at 10000,
+Semantic Scholar at 1000 per synonym query, and openFDA at 25000. bioRxiv/medRxiv caps apply to
+records scanned before keyword filtering. NIH, SEC and PatentSearch use
+bounded first pages. A reported cap or incomplete response is recorded in
+source health, retains any usable rows, and makes the pipeline run exit
+nonzero. It must not be interpreted as a complete search.
 
-**Signals** — the earlier, less reliable stream: grant awards (NIH RePORTER),
-trial registrations and results (ClinicalTrials.gov, CTIS, ISRCTN via
-`ctrdata`), regulatory decisions (openFDA), SEC filings, patents, and curated
-RSS from journals, institutions, wires, trade press and company investor
-relations. Every signal carries an explicit confidence tier.
-
-All sources are free. No institutional access required.
-
-Sources overlap on purpose: dedup cleans up, ranking triages. Records are
-**never dropped** — scoring orders them, it does not filter them.
+Classification uses conservative rules and available metadata; it has not
+been validated against an independently labelled scientific corpus. Ranking
+orders retrieved records and does not discard low scores. Deduplication
+prefers richer metadata and stores contributing sources and filled fields in
+`provenance`. Existing classified rows are not automatically relabelled on
+upgrade. Improved Unicode/missing-year title keys can cause some older
+records without DOIs to appear once again.
 
 ## Three services, one database
 
-| Service | Language | Role |
+| Service | Runtime | Role |
 |---|---|---|
-| `pipeline` | R, cron | fetch → dedup → classify → rank → **write** |
-| `web` | Python/FastAPI | RSS feeds (open) · dashboard (password + TOTP) · REST API (token) |
-| `scheduler` | Python | per-question email, each on its own cadence |
+| `pipeline` | R and cron | retrieve, deduplicate, classify, rank, persist; file and Zotero delivery |
+| `web` | Python/FastAPI | public feeds; password + TOTP dashboard; token API and ingest |
+| `scheduler` | Python | per-question email cadence and instant signal alerts |
 
-They never call each other. They coordinate only through
-`db/pipeline.sqlite` (WAL mode, `busy_timeout` on every connection), which is
-bind-mounted so it survives `down`/`up`.
+The services share `db/pipeline.sqlite` using WAL and a busy timeout. The
+Compose stack binds `db/`, `digests/` and `config/` to the host. Keep the
+SQLite database on local storage shared by these processes, on one host.
+Concurrent pipeline runs are locked to avoid duplicate delivery. Multi-host
+deployment requires a different database and coordination design.
 
-```
-config + dashboard + researchR
-            │
-            ▼
-   ┌──────────────────┐        ┌──────────────┐
-   │  pipeline  (R)   │───────►│              │◄──── web ────► feeds, dashboard, /api/v1
-   │  cron, 2 lanes   │        │   SQLite     │
-   └──────────────────┘        │  (WAL)       │◄──── scheduler ────► email
-                               └──────────────┘
-```
+## First run on this machine
 
-## Endpoints
+Prerequisites: Docker Engine/Desktop with Compose v2, Git, and Python 3 for
+one-time secret generation. The pipeline image uses R 4.4.1; the web and
+scheduler images use Python 3.12. Native development supports R 4.4+ and
+Python 3.12+.
 
-```
-PUBLIC (no auth — this is what Zotero subscribes to)
-  GET /                              landing page
-  GET /healthz                       liveness
-  GET /feed/{id}.xml                 curated stream (honours the digest threshold)
-  GET /feed/{id}/all.xml             everything stored — the recall safety valve
-  GET /feed/{id}/{study_type}.xml    one bucket
-  GET /feed/{id}/preprints.xml       preprints only
-  GET /signals/{id}.xml              signals at or above min_confidence
-  GET /signals/{id}/all.xml          every tier, including unverified
-
-DASHBOARD (session cookie + TOTP second factor)
-  GET/POST /setup /login /2fa /2fa/enroll, POST /logout
-  GET  /                             dashboard
-  GET/POST/DELETE /api/questions     manage questions
-  GET/POST /api/signal_config/{id}   signals-track settings
-  GET  /api/source_health            per-source fetch heartbeat
-  GET  /api/heartbeat                per-service liveness
-
-API (bearer token — API_TOKEN; this is what researchR speaks)
-  GET  /api/v1/meta                  the server's vocabulary
-  GET/POST/DELETE /api/v1/questions
-  GET  /api/v1/records               filter, paginate
-  GET  /api/v1/signals               filter by type and confidence floor
-  GET  /api/v1/source_health  /api/v1/heartbeat  /api/v1/signal_config/{id}
-
-INGEST (bearer token — INGEST_TOKEN; for n8n and other normalizers)
-  POST /api/ingest
+```bash
+git clone https://github.com/CTTIR/researchd.git
+cd researchd
+python3 - <<'PYENV'
+import base64, os, pathlib, re, secrets
+values = {
+    "APP_SECRET_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+    "API_TOKEN": secrets.token_hex(32),
+    "WEB_BIND": "127.0.0.1",
+    "BASE_URL": "http://127.0.0.1:8000",
+    "SECURE_COOKIE": "0",
+}
+text = pathlib.Path(".env.example").read_text()
+for name, value in values.items():
+    text = re.sub(rf"^{name}=.*$", f"{name}={value}", text, flags=re.MULTILINE)
+# Refuse to replace an existing environment or its encryption key.
+fd = os.open(".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(text)
+PYENV
 ```
 
-The three token/session surfaces are **mutually disjoint**: a dashboard
-session does not open `/api/v1`, the API token does not open `/api/ingest`,
-and neither opens the dashboard. Any token left unset makes its surface
-answer 503 rather than serving unauthenticated.
+Back up **`APP_SECRET_KEY` separately from the database**. Changing or losing
+it makes stored encrypted source keys unreadable. The engine reports the affected
+question as failed; restore the matching key or replace its stored credentials.
+Keep `.env` private and
+out of version control.
 
-## First run
-
-1. Generate the master key — it encrypts per-question API keys at rest:
+1. Edit `.env` and `config/settings.yaml` with a real contact email. Configure
+   SMTP and Zotero only if you intend to use them. For a first local run,
+   choose file delivery only and leave email recipients empty.
+2. Review `config/questions.yaml`, which seeds questions only when the
+   question table is empty. Its example enables email and Zotero delivery;
+   change `delivery` to `[file]` unless those services are configured.
+3. Start the services:
 
    ```bash
-   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   docker compose up -d --build
+   curl --fail http://127.0.0.1:8000/healthz
    ```
 
-   Put it in `.env` as `APP_SECRET_KEY`. **Back it up somewhere other than
-   the database.** It is not stored there, and without it the encrypted keys
-   in a restored backup are unreadable — you would re-enter every one.
+4. Open <http://127.0.0.1:8000/setup>, create the administrator, log in, and
+   complete **2FA enrollment**. Scan the QR code and save the recovery codes.
+   Create or edit a question, review its source toggles, lookback and delivery
+   choices, and add any required source keys.
+5. Fetch explicitly and inspect the outcome:
 
-2. `cp .env.example .env` and edit it. Generate `API_TOKEN` and, if you use
-   the ingest seam, `INGEST_TOKEN`: `openssl rand -hex 32`.
+   ```bash
+   docker compose exec pipeline Rscript R/run_all.R
+   docker compose logs --tail=100 pipeline web scheduler
+   ```
 
-3. Edit `config/settings.yaml` — SMTP host, Zotero ids, and **`contact_email`**,
-   which is sent to OpenAlex, Crossref and Unpaywall as polite-pool
-   identification. The shipped value is a placeholder.
+   A single question can be selected with
+   `docker compose exec pipeline Rscript R/run_all.R glp1_mash`. The first
+   run searches the entire lookback window and may be slow. Inspect source
+   health as well as the resulting records; zero results alone do not prove
+   that every source worked.
 
-4. `docker compose up -d --build`, then open `https://your-domain/`.
+The local HTTP settings above work only on this machine. For remote access,
+configure TLS as described below before exposing the service. Do not enable
+`RUN_ON_START` until your questions and delivery destinations are reviewed.
 
-5. `/setup` creates the admin. Logging in forces you through **2FA
-   enrollment** — scan the QR, save the eight recovery codes. There is no way
-   to reach the dashboard without it.
+To use R, install the client and use the API token from `.env`:
 
-6. Define a question, set `RUN_ON_START=1`, `docker compose up -d`, watch
-   `docker compose logs -f pipeline`, then set it back to `0`.
-
-## Two schedules, and why
-
-**Fetching** runs on cron inside the `pipeline` container, in two lanes:
-
-- `CRON_SCHEDULE` (default daily 06:00) — the full run, both tracks.
-- `CRON_FAST_SCHEDULE` (default hourly at :15) — signals only. SEC filings,
-  IR feeds and wires move in hours; PubMed moves in days. Tighten to `*/15`
-  if you want lower latency.
-
-**Email** is per question, set as its own cron expression with its own
-recipient list. `email_cron` fires in the container's `TZ`, so `0 7 * * 1`
-means Monday at seven *where you are*. The `scheduler` service checks every
-`CHECK_INTERVAL` seconds; a weekly question and a daily question coexist,
-each mailing its own list. Records are marked emailed only after a
-**successful** send, so an SMTP outage delays delivery rather than losing it.
-
-Questions with `instant_alerts` on additionally get high-priority signals
-emailed on the next tick, without waiting for the digest cadence.
-
-## Recall versus precision
-
-Everything found is stored. Per question, `digest_mode: threshold` with a
-`min_score` limits what reaches the **curated feed and the email** — the
-high-signal stream you actually read. `/feed/{id}/all.xml` always shows
-everything. Below-threshold records are never marked emailed, so lowering the
-threshold later lets them flow out retroactively.
-
-## Operations
-
-### Backups
-
-```bash
-scripts/backup.sh db/pipeline.sqlite /var/backups/researchd [keep]
+```r
+install.packages("remotes")
+remotes::install_github("CTTIR/researchR")
+library(researchR)
+# Set RESEARCHR_TOKEN in your private R environment to the .env API_TOKEN.
+con <- rr_connect("http://127.0.0.1:8000", token = Sys.getenv("RESEARCHR_TOKEN"))
+rr_questions(con)
+rr_records(con, "glp1_mash")
+rr_source_health(con)
 ```
 
-Takes a **WAL-safe** snapshot (SQLite's backup API, not `cp` — the main file
-and the `-wal` are two files, and copying them at different instants can
-produce a state that never existed), verifies it with `PRAGMA
-integrity_check`, and keeps the newest `keep` (default 14). Uses the
-`sqlite3` CLI when present and Python's `sqlite3` module otherwise, since
-neither container image ships the CLI.
+`rr_connect()` checks reachability by default. `check = FALSE` only constructs
+a client and does not verify a working connection.
 
-Cron it on the host:
+## Endpoints and access
 
-```
-0 3 * * * /srv/researchd/scripts/backup.sh /srv/researchd/db/pipeline.sqlite /var/backups/researchd
-```
+| Surface | Authentication | Main routes |
+|---|---|---|
+| Public | None | `/healthz`, `/feed/{id}.xml`, `/feed/{id}/all.xml`, `/feed/{id}/{study_type}.xml`, `/feed/{id}/preprints.xml`, `/signals/{id}.xml`, `/signals/{id}/all.xml` |
+| Dashboard | Password, TOTP and session cookie | `/setup`, `/login`, `/2fa`, `/2fa/enroll`, `/`; `/api/questions`, `/api/signal_config/{id}`, `/api/source_health`, `/api/heartbeat` |
+| Client API | Bearer `API_TOKEN` | `/api/v1/meta`, `/api/v1/questions`, `/api/v1/records`, `/api/v1/signals`, `/api/v1/source_health`, `/api/v1/heartbeat`, `/api/v1/signal_config/{id}` |
+| External ingest | Bearer `INGEST_TOKEN` | `POST /api/ingest` |
 
-**Back up `APP_SECRET_KEY` separately**, and not next to the database — the
-whole point of at-rest encryption is that a leaked backup is not a leaked
-key.
+These credentials are separate: a dashboard session cannot authenticate the
+client API, and the client token cannot authenticate ingest. An unset token
+disables its surface with HTTP 503. Feed URLs and feed contents are public;
+do not put confidential research into a deployment with public feed access.
 
-### Restore
+The curated feed and email honor the question's threshold. An `all.xml` feed
+removes that threshold but is still limited to the newest `FEED_LIMIT` rows
+(default 100). Retrieve the stored collection through the paginated API.
+Offsets are not a transactional snapshot: avoid concurrent ingestion when
+exporting an exact dataset. Below-threshold records remain stored until
+explicit retention pruning and may become eligible when thresholds change.
 
-```bash
-docker compose down          # nothing may be writing during a restore
-scripts/restore.sh /var/backups/researchd/pipeline-20260826-030000.sqlite db/pipeline.sqlite
-docker compose up -d
-```
+## Schedules and delivery
 
-Verifies the snapshot first, moves the existing database aside instead of
-deleting it, and clears any stale `-wal`. `APP_SECRET_KEY` must be the value
-it was when the backup was taken.
+`CRON_SCHEDULE` defaults to daily 06:00 for the full pipeline;
+`CRON_FAST_SCHEDULE` defaults to hourly at :15 for signals only. Set `TZ`
+to the intended time zone. A manual run can select `RUN_MODE=lit` or
+`RUN_MODE=signals`; the default is `all`. Failed questions or incomplete
+sources do not stop the other questions from being processed, but cause a
+nonzero exit and a degraded pipeline heartbeat.
 
-### Retention
+Email has its own per-question `email_cron`, interpreted in `TZ`, and
+recipient list. The scheduler checks every `CHECK_INTERVAL` seconds. Instant
+alerts send eligible high-priority signals on a subsequent tick. Records are
+marked emailed only after successful delivery. A partial SMTP recipient
+failure can cause already-accepted recipients to receive a duplicate on
+retry; there is no per-recipient delivery ledger. Unknown signal types remain
+visible in digests instead of being silently dropped.
 
-`records`, `signals`, `fetch_log` and `digests/` grow without bound.
-
-```
-0 4 1 * * /srv/researchd/scripts/prune.sh /srv/researchd/db/pipeline.sqlite /srv/researchd/digests
-```
-
-Prunes records and signals older than 24 months (configurable), caps
-`fetch_log` at 5000 rows, keeps the newest 60 digest files, and checkpoints
-the WAL. Questions, concepts, auth, sessions and heartbeats are never
-touched. Note that pruning a record frees its dedup key, so the same paper
-could resurface as "new" — the default window is far outside any question's
-lookback, but shorten it knowingly.
-
-The engine also checkpoints the WAL at the end of every run, so it stays
-bounded between prunes.
-
-### Is it still working?
-
-The worst failure of a surveillance system is silence that looks like a quiet
-week.
-
-- `GET /api/source_health` — per source: last successful fetch, last fetch
-  that actually returned rows, error count, and a `stale` flag. Watch
-  `last_nonempty` as closely as `last_ok`: a source can answer happily while
-  its query has stopped matching anything.
-- `GET /api/heartbeat` — per service: did the engine and the scheduler run at
-  all. A crashed engine writes no `fetch_log` rows either, so without this
-  "dead engine" and "dead source" look identical.
-- `docker compose logs -f pipeline | web | scheduler`.
+File and Zotero delivery use persisted pending state for new records,
+including records received through ingest. Failed delivery is retried by a
+later full/literature run even if no new source records arrive. Digest files
+have unique names; Zotero retains remote item keys for retry reconciliation.
+A process failure after writing files but before acknowledging them in SQLite
+can leave duplicate digest files on retry; their contents are preserved.
+Existing historical rows are not replayed automatically after this upgrade.
+Signals reach users through feeds and the email scheduler. The old global
+`email` block in settings belongs to the legacy direct-delivery helper;
+normal service email is configured through `.env` and each question.
 
 ## TLS reverse proxy
 
-`web` speaks plain HTTP on 8000 and must sit behind a TLS terminator. Feeds
-and the dashboard are internet-facing, and `SECURE_COOKIE=1` (the default)
-means the browser will not return the session cookie over plain HTTP — you
-would be unable to log in. Set `SECURE_COOKIE=0` **only** for local testing.
+The web service speaks HTTP on port 8000. For production, set `BASE_URL` to
+your public HTTPS URL and `SECURE_COOKIE=1`. Compose binds the host port to
+`127.0.0.1` by default through `WEB_BIND`; it is not an Internet listener.
 
-Caddy, which handles certificates automatically:
+For Caddy running **on the host**, configure your domain's DNS, allow inbound
+ports 80/443 for Caddy, and use:
 
-```
+```caddyfile
 feeds.example.org {
-    reverse_proxy web:8000
+    reverse_proxy 127.0.0.1:8000
 }
 ```
 
-Nginx:
+For Caddy **in a container**, join it to the same Compose network and use
+`reverse_proxy web:8000`. Container-local `127.0.0.1` points to Caddy itself,
+so the host example cannot be copied unchanged into a proxy container. Keep
+port 8000 private and protect the proxy's certificate/configuration state.
 
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name feeds.example.org;
-    ssl_certificate     /etc/letsencrypt/live/feeds.example.org/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/feeds.example.org/privkey.pem;
+The encryption key protects a stolen database or backup, not a compromised
+host holding both `.env` and the database. Authentication attempt limits are
+in-process and reset when the web service restarts; use an additional proxy
+rate limit if you need a persistent boundary or multiple web workers.
 
-    location / {
-        proxy_pass         http://web:8000;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-}
-```
+## Operations
 
-Put the proxy on the same Docker network as `web`, set `BASE_URL` to the
-public URL so feed self-links are right, and do not publish port 8000 to the
-internet directly.
-
-## Threat model, honestly
-
-At-rest encryption protects a leaked database or backup. It does **not**
-protect against host compromise: `APP_SECRET_KEY` lives in `.env` on the same
-machine. The dashboard is password + TOTP; feeds are deliberately open, so
-treat a feed URL as public. Put `web` behind TLS and keep `SECURE_COOKIE=1`.
-
-## Running the engine by hand
+Back up SQLite through its backup API, not by copying an actively written
+main database without its WAL:
 
 ```bash
-docker compose exec pipeline Rscript R/run_all.R              # all questions
-docker compose exec pipeline Rscript R/run_all.R glp1_mash    # just one
-docker compose exec pipeline env RUN_MODE=signals Rscript R/run_all.R
+scripts/backup.sh db/pipeline.sqlite /var/backups/researchd 14
 ```
 
-`RUN_MODE` is `all` (default), `lit` or `signals`. The engine exits non-zero
-if any question failed, while still processing the rest.
+The Python 3 helper checks integrity, gives each snapshot a unique filename,
+and keeps the newest 14 snapshots. Use the path printed by the backup command. Schedule it
+on the host and back up `APP_SECRET_KEY` separately. To restore, first stop
+all writers; the restore script validates the backup and preserves the replaced
+database together with any WAL/SHM recovery files:
 
-Bare R, no Docker: `Rscript R/run_all.R`, or `./cron.sh` as a host cron
-wrapper.
+```bash
+docker compose down
+scripts/restore.sh /var/backups/researchd/pipeline-YYYYMMDD-HHMMSS-SUFFIX.sqlite db/pipeline.sqlite
+docker compose up -d
+```
 
-## Tests
+Retention is opt-in; otherwise records, signals, fetch logs and digest files
+grow without bound:
 
-`dev/tests/` contains offline checks using temporary databases and synthetic fixtures.
-Create a local test environment before running them:
+```bash
+scripts/prune.sh db/pipeline.sqlite digests
+```
+
+The default removes records/signals older than 24 months, limits fetch logs
+to 5000 rows and keeps 60 files of each digest format. Records with unfinished
+file or Zotero delivery remain stored until delivery succeeds; disable or
+resolve a stale destination before expecting those records to expire. Read the script's arguments before
+changing these limits. Pruning frees deduplication keys, so a later fetch
+can rediscover a removed record. Verify backup/restore on a disposable copy
+before relying on a deployment.
+
+Monitor source health (`last_ok`, `last_nonempty`, errors and staleness) and
+service heartbeats in the dashboard or client API. `/healthz` is web liveness,
+not evidence that the pipeline, scheduler or upstream sources are healthy.
+The engine checkpoints the WAL after each run. Configure SMTP delivery and
+sender-domain authentication with your chosen relay before enabling email.
+
+## Native development and tests
+
+Python dependencies are pinned in `requirements-web.txt`,
+`requirements-scheduler.txt`, `requirements-test.txt` and
+`constraints-python.txt`. R adapters are installed during Docker builds.
+Runtime startup reports missing packages and never installs them itself.
+
+For native development, create the Python environment and install the core
+R and client test dependencies (Node.js 24 is needed only for the dashboard
+DOM regression):
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements-test.txt
+.venv/bin/python -m pip install -r requirements-test.txt
+Rscript -e 'install.packages(c("yaml", "DBI", "RSQLite", "filelock", "httr2", "jsonlite", "htmltools", "cli", "tibble", "testthat", "pkgload"), repos = "https://cloud.r-project.org")'
+PATH="$PWD/.venv/bin:$PATH" dev/tests/run_all.sh
 ```
 
-The R checks use the dependencies listed in the pipeline Dockerfile.
-
-Run them all with `dev/tests/run_all.sh` (add `--live` for the two that need
-network), or individually:
+To run the actual adapters natively, install their complete declared set:
 
 ```bash
-.venv/bin/python dev/tests/schema_coverage.py .      # SQL vs schema
-.venv/bin/python dev/tests/db_phase2.py              # WAL, contention, cascade
-.venv/bin/python dev/tests/taxonomy_sync.py          # the three-way label sync
-.venv/bin/python dev/tests/web_phase4.py             # feeds, auth, 2FA, /api/v1
-.venv/bin/python dev/tests/scheduler_phase5.py       # cadence and dispatch
-.venv/bin/python dev/tests/integration_phase6.py     # all services, one DB
-.venv/bin/python dev/tests/security_phase7.py        # adversarial pass
-.venv/bin/python dev/tests/ops_phase8.py             # restart, backup, retention
-dev/tests/Rrun.sh dev/tests/parse_all.R              # every engine source parses
-dev/tests/Rrun.sh dev/tests/classify_table.R         # classifier edge cases
-dev/tests/Rrun.sh dev/tests/dedup_rank.R             # dedup and ranking
-dev/tests/Rrun.sh dev/tests/fetch_plumbing.R         # sources, keys, isolation
-dev/tests/Rrun.sh dev/tests/live_fetchers.R          # the real external APIs
-dev/tests/integration_client.sh                      # the researchR client, live
+Rscript -e 'source("R/00_utils.R"); install.packages(REQUIRED_PKGS, repos = "https://cloud.r-project.org")'
+PATH="$PWD/.venv/bin:$PATH" Rscript R/run_all.R
 ```
 
-`integration_client.sh` needs a **researchR checkout**. Clone it beside this
-repository and it is found automatically, or point `RESEARCHR_PKG` at it:
+Native processes do not load `.env` automatically. Supply the same exported
+encryption key and required service variables when using encrypted question
+keys; configure `config/settings.yaml` and `config/questions.yaml` before
+running the engine. `.venv/` and the test scratch library/database under
+`dev/state/tmp/` are ignored by Git.
+
+The offline suite uses disposable SQLite databases, synthetic upstream and
+SMTP responses, and regression checks across the engine, web and scheduler.
+The client integration starts a real local HTTP server with a synthetic
+database and requires a sibling client checkout:
 
 ```bash
 git clone https://github.com/CTTIR/researchR.git ../researchR
-dev/tests/integration_client.sh
+PATH="$PWD/.venv/bin:$PATH" dev/tests/integration_client.sh
 ```
 
-The local verification environment is a Python venv at `.venv/` and a private
-R library at `dev/state/tmp/Rlib`, both gitignored. Neither is part of the
-deployed stack — the containers install their own dependencies at build time.
+Alternatively set `RESEARCHR_PKG` to a client checkout. This integration
+does not contact biomedical databases or send real email. The opt-in
+`dev/tests/run_all.sh --live` also calls upstream APIs through
+`dev/tests/live_fetchers.R`; skipped sources are evidence gaps, not verified
+successes. It may incur provider quota usage and requires the full adapter
+dependencies and any source credentials.
 
-## Known limits
-
-- **Free-only means "first wave", not literally first.** The genuinely
-  earliest signals — company topline press, professional pipeline databases,
-  real-time conference coverage — are paid or unstructured.
-- **WHO ICTRP is not covered.** `ctrdata` reaches CTGOV2, CTIS and ISRCTN
-  only; ChiCTR, jRCT and CTRI are a real gap for global scope, and ICTRP
-  offers only weekly bulk XML.
-- **Semantic Scholar is rate-limited without a key** and will often return
-  nothing; the fetcher backs off and degrades cleanly.
-- **bioRxiv has no query grammar**, so it pulls a window and filters
-  client-side — correct but slow (roughly a minute per two days of window).
-- **PubMed abstracts are not fetched** (esummary omits them); ranking scores
-  its title. Europe PMC and OpenAlex supply abstracts and dedup prefers them.
-- **Scrapers are a framework plus seeded targets**, not coverage. They break
-  when sites change, and everything scraped is `unverified`.
-- **One SQLite file, three writers** is right for one host and the thing that
-  will outgrow first. Postgres is the move the moment you want a second
-  machine.
-- **Self-hosted SMTP lands in spam** without SPF/DKIM/DMARC and IP
-  reputation. A transactional relay via the same SMTP settings sidesteps it.
-- **The first run is heavy** — the whole lookback window is "new".
+GitHub Actions defines the offline/native client integration and a separate
+Compose build/start smoke test. The workflow can be dispatched with a
+`client_ref` to test a matching researchR branch or commit; ordinary runs use
+its main branch. Configuring this workflow does not establish that a hosted
+run or a Docker build has succeeded; consult the maintenance record and
+actual workflow results.
 
 ## License
 

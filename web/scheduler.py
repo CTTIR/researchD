@@ -17,7 +17,10 @@
 #   SMTP_TLS = starttls | ssl | none
 # ============================================================
 import os, json, time, sqlite3, smtplib, ssl
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from html import escape
+from urllib.parse import urlsplit
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
@@ -65,7 +68,8 @@ def now_local():
     silently shift every digest by the local offset (two hours, for a
     Europe/Berlin deployment in summer).
     """
-    return datetime.now().astimezone()
+    zone = os.environ.get("TZ", "")
+    return datetime.now(ZoneInfo(zone)) if zone else datetime.now().astimezone()
 
 
 def heartbeat(ok=True, detail="", error=""):
@@ -108,8 +112,9 @@ def is_due(cron_expr, last_sent_iso, now):
         except Exception:
             base = None
     if base is None:
-        # never sent: due if there's a scheduled point in the last 24h
-        base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # A new schedule can first run at any fire point today, including
+        # midnight. croniter.get_next is exclusive of its starting instant.
+        base = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(microseconds=1)
     try:
         nxt = croniter(cron_expr, base).get_next(datetime)
         if nxt.tzinfo is None:
@@ -120,23 +125,41 @@ def is_due(cron_expr, last_sent_iso, now):
         return False
 
 
+def _text(value):
+    return escape(str(value or ""), quote=True)
+
+
+def _link(url, title):
+    # Metadata is external input. Escape text and attributes separately, and
+    # never create executable/data links in a digest.
+    value = str(url or "")
+    try:
+        parsed = urlsplit(value)
+        safe = (parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname)
+                and not any(ord(c) < 32 for c in value))
+    except ValueError:
+        safe = False
+    label = f"<strong>{_text(title)}</strong>"
+    return f'<a href="{_text(value)}">{label}</a>' if safe else label
+
+
 def render_html(label, rows):
-    parts = [f"<h1>{label}</h1>"]
+    parts = [f"<h1>{_text(label)}</h1>"]
     by_type = {}
     for r in rows:
         by_type.setdefault(r["study_type"] or "unclassified", []).append(r)
-    for st in STUDY_ORDER:
+    for st in STUDY_ORDER + sorted(set(by_type) - set(STUDY_ORDER)):
         sub = by_type.get(st, [])
         if not sub:
             continue
-        parts.append(f"<h3 style='border-bottom:1px solid #ddd'>{STUDY_LABEL[st]} ({len(sub)})</h3><ol>")
+        parts.append(f"<h3 style='border-bottom:1px solid #ddd'>{_text(STUDY_LABEL.get(st, st))} ({len(sub)})</h3><ol>")
         for r in sub:
             pp = " <span style='background:#fff3cd;padding:1px 5px;border-radius:3px;font-size:11px'>preprint</span>" if r["is_preprint"] else ""
-            src = f"<span style='background:#eee;padding:1px 5px;border-radius:3px;font-size:11px'>{r['source']}</span>"
+            src = f"<span style='background:#eee;padding:1px 5px;border-radius:3px;font-size:11px'>{_text(r['source'])}</span>"
             parts.append(
                 f"<li style='margin-bottom:10px'>{src}{pp} "
-                f"<a href='{r['url']}'><strong>{r['title']}</strong></a><br>"
-                f"<span style='color:#555;font-size:13px'>{(r['authors'] or '')[:120]} · {r['pub_date']}</span></li>")
+                f"{_link(r['url'], r['title'])}<br>"
+                f"<span style='color:#555;font-size:13px'>{_text((r['authors'] or '')[:120])} · {_text(r['pub_date'])}</span></li>")
         parts.append("</ol>")
     return "\n".join(parts)
 
@@ -164,26 +187,29 @@ def render_signals_html(rows):
     parts = ["<h2 style='margin-top:24px'>Signals (early intelligence)</h2>"]
     by_type = {}
     for r in rows:
-        by_type.setdefault(r["signal_type"], []).append(r)
-    for st in SIGNAL_ORDER:
+        by_type.setdefault(r["signal_type"] or "unclassified", []).append(r)
+    for st in SIGNAL_ORDER + sorted(set(by_type) - set(SIGNAL_ORDER)):
         sub = by_type.get(st, [])
         if not sub:
             continue
-        parts.append(f"<h3 style='border-bottom:1px solid #ddd'>{SIGNAL_LABEL.get(st, st)} ({len(sub)})</h3><ol>")
+        parts.append(f"<h3 style='border-bottom:1px solid #ddd'>{_text(SIGNAL_LABEL.get(st, st))} ({len(sub)})</h3><ol>")
         for r in sub:
             conf = r["confidence"] or "reported"
             badge = {"authoritative": "#d4edda", "reported": "#fff3cd",
                      "unverified": "#f8d7da"}.get(conf, "#eee")
             parts.append(
                 f"<li style='margin-bottom:10px'>"
-                f"<span style='background:{badge};padding:1px 5px;border-radius:3px;font-size:11px'>{conf}</span> "
-                f"<a href='{r['url']}'><strong>{r['title']}</strong></a><br>"
-                f"<span style='color:#555;font-size:13px'>{(r['org'] or '')[:80]} · {r['signal_date'] or ''}</span></li>")
+                f"<span style='background:{badge};padding:1px 5px;border-radius:3px;font-size:11px'>{_text(conf)}</span> "
+                f"{_link(r['url'], r['title'])}<br>"
+                f"<span style='color:#555;font-size:13px'>{_text((r['org'] or '')[:80])} · {_text(r['signal_date'])}</span></li>")
         parts.append("</ol>")
     return "\n".join(parts)
 
 
 def send_email(to_list, subject, html):
+    if SMTP_TLS not in ("starttls", "ssl", "none"):
+        print("[scheduler] invalid SMTP_TLS; expected starttls, ssl or none", flush=True)
+        return False
     if not SMTP_HOST:
         print("[scheduler] SMTP_HOST not set; skipping send", flush=True)
         return False
@@ -194,82 +220,130 @@ def send_email(to_list, subject, html):
     try:
         if SMTP_TLS == "ssl":
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=30) as s:
                 if SMTP_USER: s.login(SMTP_USER, SMTP_PW)
-                s.sendmail(SMTP_FROM, to_list, msg.as_string())
+                refused = s.sendmail(SMTP_FROM, to_list, msg.as_string())
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
                 if SMTP_TLS == "starttls":
                     s.starttls(context=ssl.create_default_context())
                 if SMTP_USER: s.login(SMTP_USER, SMTP_PW)
-                s.sendmail(SMTP_FROM, to_list, msg.as_string())
+                refused = s.sendmail(SMTP_FROM, to_list, msg.as_string())
+        if refused:
+            # SMTP accepts partial delivery without throwing. Keep the batch
+            # pending so refused recipients are retried; accepted recipients
+            # may receive a duplicate on retry until per-recipient state exists.
+            print(f"[scheduler] partial delivery: {len(refused)} recipient(s) refused; batch retained for retry", flush=True)
+            return False
         return True
     except Exception as e:
         print(f"[scheduler] send failed: {e}", flush=True)
         return False
 
 
+def _send_digest(con, q, now):
+    to_list = json.loads(q["email_to"] or "[]")
+    if not to_list:
+        return True
+    if not is_due(q["email_cron"], q["email_last_sent"], now):
+        return True
+    # Recall safety-valve: email the high-signal stream. Records below the
+    # threshold are still stored and visible in all.xml; they just don't
+    # generate email noise. They are NOT marked emailed, so if you later
+    # lower the threshold they can still go out.
+    threshold_sql = ""
+    params = [q["id"]]
+    if (q["digest_mode"] if "digest_mode" in q.keys() else "all") == "threshold":
+        ms = q["min_score"] if "min_score" in q.keys() else 0
+        threshold_sql = " AND score >= ?"
+        params.append(float(ms or 0))
+    rows = con.execute(
+        "SELECT * FROM records WHERE question_id=? AND emailed=0" + threshold_sql +
+        " ORDER BY study_type, score DESC", params).fetchall()
+    # signals for this question's digest, honoring its min_confidence
+    cfg = con.execute("SELECT min_confidence FROM signal_config WHERE question_id=?",
+                      (q["id"],)).fetchone()
+    minc = (cfg["min_confidence"] if cfg else None) or "unverified"
+    allowed = [k for k, v in CONFIDENCE_RANK.items()
+               if v >= CONFIDENCE_RANK.get(minc, 0)]
+    sig_rows = con.execute(
+        "SELECT * FROM signals WHERE question_id=? AND emailed=0 AND confidence IN (%s)"
+        " ORDER BY signal_type, score DESC" % ",".join("?" * len(allowed)),
+        (q["id"], *allowed)).fetchall()
+    if not rows and not sig_rows:
+        # nothing new; still advance last_sent so we don't recheck constantly
+        con.execute("UPDATE questions SET email_last_sent=? WHERE id=?",
+                    (now.isoformat(), q["id"]))
+        con.commit()
+        return True
+    html = render_html(q["label"], rows) + render_signals_html(sig_rows)
+    subject = f"[Research] {q['label']} — {len(rows)} papers, {len(sig_rows)} signals"
+    if send_email(to_list, subject, html):
+        ids = [(r["dedup_key"], q["id"]) for r in rows]
+        con.executemany(
+            "UPDATE records SET emailed=1 WHERE dedup_key=? AND question_id=?", ids)
+        sids = [(r["dedup_key"], q["id"]) for r in sig_rows]
+        con.executemany(
+            "UPDATE signals SET emailed=1 WHERE dedup_key=? AND question_id=?", sids)
+        con.execute("UPDATE questions SET email_last_sent=? WHERE id=?",
+                    (now.isoformat(), q["id"]))
+        con.commit()
+        print(f"[scheduler] sent {len(rows)} records + {len(sig_rows)} signals for {q['id']} to {len(to_list)} recipient(s)", flush=True)
+    else:
+        return False
+    return True
+
+
 def run_once():
     now = now_local()
     con = db()
-    qs = con.execute(
-        "SELECT * FROM questions WHERE enabled=1 AND email_enabled=1").fetchall()
-    for q in qs:
-        to_list = json.loads(q["email_to"] or "[]")
-        if not to_list:
-            continue
-        if not is_due(q["email_cron"], q["email_last_sent"], now):
-            continue
-        # Recall safety-valve: email the high-signal stream. Records below the
-        # threshold are still stored and visible in all.xml; they just don't
-        # generate email noise. They are NOT marked emailed, so if you later
-        # lower the threshold they can still go out.
-        threshold_sql = ""
-        if (q["digest_mode"] if "digest_mode" in q.keys() else "all") == "threshold":
-            ms = q["min_score"] if "min_score" in q.keys() else 0
-            threshold_sql = f" AND score >= {float(ms or 0)}"
-        rows = con.execute(
-            "SELECT * FROM records WHERE question_id=? AND emailed=0" + threshold_sql +
-            " ORDER BY study_type, score DESC", (q["id"],)).fetchall()
-        # signals for this question's digest, honoring its min_confidence
-        cfg = con.execute("SELECT min_confidence FROM signal_config WHERE question_id=?",
-                          (q["id"],)).fetchone()
-        minc = (cfg["min_confidence"] if cfg else None) or "unverified"
-        allowed = [k for k, v in CONFIDENCE_RANK.items()
-                   if v >= CONFIDENCE_RANK.get(minc, 0)]
-        sig_rows = con.execute(
-            "SELECT * FROM signals WHERE question_id=? AND emailed=0 AND confidence IN (%s)"
-            " ORDER BY signal_type, score DESC" % ",".join("?" * len(allowed)),
-            (q["id"], *allowed)).fetchall()
-        if not rows and not sig_rows:
-            # nothing new; still advance last_sent so we don't recheck constantly
-            con.execute("UPDATE questions SET email_last_sent=? WHERE id=?",
-                        (now.isoformat(), q["id"]))
-            con.commit()
-            continue
-        html = render_html(q["label"], rows) + render_signals_html(sig_rows)
-        n_total = len(rows) + len(sig_rows)
-        subject = f"[Research] {q['label']} — {len(rows)} papers, {len(sig_rows)} signals"
-        if send_email(to_list, subject, html):
-            ids = [(r["dedup_key"], q["id"]) for r in rows]
-            con.executemany(
-                "UPDATE records SET emailed=1 WHERE dedup_key=? AND question_id=?", ids)
-            sids = [(r["dedup_key"], q["id"]) for r in sig_rows]
-            con.executemany(
-                "UPDATE signals SET emailed=1 WHERE dedup_key=? AND question_id=?", sids)
-            con.execute("UPDATE questions SET email_last_sent=? WHERE id=?",
-                        (now.isoformat(), q["id"]))
-            con.commit()
-            print(f"[scheduler] sent {len(rows)} records + {len(sig_rows)} signals for {q['id']} to {len(to_list)} recipient(s)", flush=True)
-    con.close()
+    ok = True
+    try:
+        qs = con.execute(
+            "SELECT * FROM questions WHERE enabled=1 AND email_enabled=1").fetchall()
+        for q in qs:
+            try:
+                ok = _send_digest(con, q, now) and ok
+            except Exception as exc:
+                con.rollback()
+                print(f"[scheduler] digest failed for {q['id']}: {exc}", flush=True)
+                ok = False
+        return ok
+    finally:
+        con.close()
+
+
+def _send_alert(con, q):
+    to_list = json.loads(q["email_to"] or "[]")
+    if not to_list:
+        return True
+    marks = ",".join("?" * len(ALERT_TYPES))
+    rows = con.execute(
+        f"SELECT * FROM signals WHERE question_id=? AND emailed=0 "
+        f"AND signal_type IN ({marks}) "
+        f"AND confidence IN ('authoritative','reported') "
+        f"ORDER BY score DESC LIMIT 20",
+        (q["id"], *ALERT_TYPES)).fetchall()
+    if not rows:
+        return True
+    html = ("<p style='color:#a00'><strong>Instant alert</strong> — "
+            "high-priority signals just detected:</p>") + render_signals_html(rows)
+    subject = f"[ALERT] {q['label']} — {len(rows)} high-priority signal(s)"
+    if send_email(to_list, subject, html):
+        ids = [(r["dedup_key"], q["id"]) for r in rows]
+        con.executemany(
+            "UPDATE signals SET emailed=1 WHERE dedup_key=? AND question_id=?", ids)
+        con.commit()
+        print(f"[scheduler] INSTANT alert: {len(rows)} for {q['id']}", flush=True)
+    else:
+        return False
+    return True
 
 
 def run_alerts():
-    """The 'be first' tier. For questions with signal_config.instant_alerts=1,
-    email high-priority signals (ALERT_TYPES, confidence >= reported)
-    IMMEDIATELY — on the next scheduler tick, not the digest cron. Sent
-    signals are marked emailed so the digest doesn't repeat them."""
+    """Send high-priority signals on each tick; retain failed batches for retry."""
     con = db()
+    ok = True
     try:
         qs = con.execute("""
             SELECT q.*, sc.instant_alerts FROM questions q
@@ -277,27 +351,13 @@ def run_alerts():
             WHERE q.enabled=1 AND q.email_enabled=1 AND sc.instant_alerts=1
         """).fetchall()
         for q in qs:
-            to_list = json.loads(q["email_to"] or "[]")
-            if not to_list:
-                continue
-            marks = ",".join("?" * len(ALERT_TYPES))
-            rows = con.execute(
-                f"SELECT * FROM signals WHERE question_id=? AND emailed=0 "
-                f"AND signal_type IN ({marks}) "
-                f"AND confidence IN ('authoritative','reported') "
-                f"ORDER BY score DESC LIMIT 20",
-                (q["id"], *ALERT_TYPES)).fetchall()
-            if not rows:
-                continue
-            html = ("<p style='color:#a00'><strong>Instant alert</strong> — "
-                    "high-priority signals just detected:</p>") + render_signals_html(rows)
-            subject = f"[ALERT] {q['label']} — {len(rows)} high-priority signal(s)"
-            if send_email(to_list, subject, html):
-                ids = [(r["dedup_key"], q["id"]) for r in rows]
-                con.executemany(
-                    "UPDATE signals SET emailed=1 WHERE dedup_key=? AND question_id=?", ids)
-                con.commit()
-                print(f"[scheduler] INSTANT alert: {len(rows)} for {q['id']}", flush=True)
+            try:
+                ok = _send_alert(con, q) and ok
+            except Exception as exc:
+                con.rollback()
+                print(f"[scheduler] alert failed for {q['id']}: {exc}", flush=True)
+                ok = False
+        return ok
     finally:
         con.close()
 
@@ -314,9 +374,11 @@ if __name__ == "__main__":
     while True:
         ticks += 1
         try:
-            run_alerts()   # instant tier first (every tick)
-            run_once()     # digest tier (per-question cron)
-            heartbeat(ok=True, detail=f"tick {ticks}; interval {CHECK_INTERVAL}s")
+            alerts_ok = run_alerts()  # instant tier first (every tick)
+            digest_ok = run_once()    # digest tier (per-question cron)
+            ok = alerts_ok and digest_ok
+            heartbeat(ok=ok, detail=f"tick {ticks}; interval {CHECK_INTERVAL}s",
+                      error="" if ok else "One or more email batches failed; see scheduler log")
         except Exception as e:
             print(f"[scheduler] loop error: {e}", flush=True)
             heartbeat(ok=False, detail=f"tick {ticks}", error=str(e))

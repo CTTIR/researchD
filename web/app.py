@@ -25,15 +25,18 @@
 # ============================================================
 import os, json, sqlite3, secrets as pysecrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import format_datetime
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Form, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
+from typing import Literal
+from urllib.parse import urlsplit
+from croniter import croniter
 import jinja2
 
 from web import security as sec
@@ -56,6 +59,17 @@ API_TOKEN = os.environ.get("API_TOKEN", "")
 BASE_DIR = Path(__file__).parent
 app = FastAPI(title="Research Feed Service")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+@app.middleware("http")
+async def response_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.url.path == "/" or request.url.path.startswith(("/api/", "/setup", "/login", "/2fa")):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 _jenv = jinja2.Environment(
     loader=jinja2.FileSystemLoader(str(BASE_DIR / "templates")),
@@ -90,6 +104,7 @@ _MIGRATIONS = [
     ("signal_config", "feed_categories", "TEXT DEFAULT '{}'"),
     ("signal_config", "instant_alerts", "INTEGER DEFAULT 0"),
     ("records", "oa_url", "TEXT"),
+    ("records", "provenance", "TEXT DEFAULT '[]'"),
 ]
 def _migrate(con):
     for table, col, coldef in _MIGRATIONS:
@@ -214,7 +229,7 @@ def _render_feed(qrow, rows, self_url) -> str:
     return (f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<rss version='2.0' xmlns:atom='http://www.w3.org/2005/Atom'>"
             f"<channel><title>{title}</title><link>{escape(self_url)}</link>"
-            f"<atom:link href='{escape(self_url)}' rel='self' type='application/rss+xml'/>"
+            f"<atom:link href={quoteattr(self_url)} rel='self' type='application/rss+xml'/>"
             f"<description>Auto-curated literature feed</description>"
             f"<lastBuildDate>{now}</lastBuildDate>{items}</channel></rss>")
 
@@ -311,7 +326,7 @@ def _signals_feed_response(qid, request, where="", params=()):
     xml = (f"<?xml version='1.0' encoding='UTF-8'?>"
            f"<rss version='2.0' xmlns:atom='http://www.w3.org/2005/Atom'>"
            f"<channel><title>{title}</title><link>{escape(self_url)}</link>"
-           f"<atom:link href='{escape(self_url)}' rel='self' type='application/rss+xml'/>"
+           f"<atom:link href={quoteattr(self_url)} rel='self' type='application/rss+xml'/>"
            f"<description>Early intelligence: trials, grants, filings, patents, press</description>"
            f"<lastBuildDate>{now}</lastBuildDate>{items}</channel></rss>")
     return Response(xml, media_type="application/rss+xml")
@@ -342,17 +357,47 @@ def signals_feed_by_type(qid: str, stype: str, request: Request):
 # ============================================================
 SIGNAL_SOURCES = ["sec_edgar", "nih_reporter", "openfda", "trials",
                   "patentsview", "epo_ops", "feeds", "cortellis", "citeline"]
-SIGNAL_KEY_SOURCES = ["epo_ops", "openfda", "cortellis", "citeline"]
+SIGNAL_KEY_SOURCES = ["epo_ops", "openfda", "patentsview", "cortellis", "citeline"]
 FEED_CATEGORIES = ["literature_alert", "institution", "aggregator",
                    "trade_press", "news", "ir_alert", "conference"]
 
+def valid_http_url(value):
+    try:
+        parsed = urlsplit(value)
+        return (parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname)
+                and not parsed.username and not parsed.password
+                and not any(ord(c) < 32 for c in value))
+    except (TypeError, ValueError):
+        return False
+
+
 class SignalConfig(BaseModel):
-    sources: dict = {}                # {source: bool}
-    min_confidence: str = "unverified"
-    instant_alerts: bool = False
-    feed_categories: dict = {}        # {category: bool}; empty = all on
-    scrape_targets: list = []         # [{name,url,type,selector?}]
-    api_keys: dict = {}               # write-only plaintext; "__CLEAR__" removes
+    sources: dict[str, StrictBool] = Field(default_factory=dict)
+    min_confidence: Literal["unverified", "reported", "authoritative"] = "unverified"
+    instant_alerts: StrictBool = False
+    feed_categories: dict[str, StrictBool] = Field(default_factory=dict)
+    scrape_targets: list[dict] = Field(default_factory=list)
+    api_keys: dict[str, StrictStr] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_config(self):
+        for values, known, label in ((self.sources, SIGNAL_SOURCES, "signal source"),
+                                     (self.feed_categories, FEED_CATEGORIES, "feed category"),
+                                     (self.api_keys, SIGNAL_KEY_SOURCES, "signal key")):
+            unknown = set(values) - set(known)
+            if unknown:
+                raise ValueError(f"Unknown {label}: {', '.join(sorted(unknown))}")
+        for target in self.scrape_targets:
+            url = target.get("url", "")
+            if not isinstance(url, str) or not valid_http_url(url):
+                raise ValueError("Scrape target URL must be an absolute HTTP(S) URL without credentials")
+            if target.get("type") not in ("rss", "html"):
+                raise ValueError("Scrape target type must be rss or html")
+            for field in ("name", "selector"):
+                if field in target and not isinstance(target[field], str):
+                    raise ValueError(f"Scrape target {field} must be text")
+            target.setdefault("name", "")
+        return self
 
 @app.get("/api/signal_config/{qid}")
 def get_signal_config(qid: str, user: str = Depends(require_user)):
@@ -466,6 +511,19 @@ def healthz():
     return "ok"
 
 
+# Each process bounds password and MFA attempts per direct client address.
+# The deployment uses one web worker; trusted proxy configuration determines
+# request.client. Limits are intentionally not based on spoofable raw headers.
+_AUTH_LIMIT = sec.AttemptLimiter(limit=20, window_seconds=300)
+
+def _limit_auth(request, stage):
+    host = request.client.host if request.client else "unknown"
+    wait = _AUTH_LIMIT.retry_after((stage, host))
+    if wait:
+        raise HTTPException(429, "Too many authentication attempts; try again later",
+                            headers={"Retry-After": str(wait)})
+
+
 # ================= AUTH: SETUP / LOGIN / 2FA ==================
 @app.get("/setup", response_class=HTMLResponse)
 def setup_form(request: Request):
@@ -480,10 +538,10 @@ def setup_submit(username: str = Form(...), password: str = Form(...),
     con = db()
     if get_admin(con):
         con.close(); return RedirectResponse("/login", 303)
-    if len(password) < 10 or password != password2:
+    if len(password) < 10 or len(password.encode("utf-8")) > 72 or password != password2:
         con.close()
         return render("setup.html",
-                      error="Passwords must match and be ≥10 characters.")
+                      error="Passwords must match, contain at least 10 characters, and fit within 72 UTF-8 bytes.")
     con.execute("INSERT INTO auth(id,username,pw_hash) VALUES(1,?,?)",
                 (username, sec.hash_pw(password)))
     con.commit(); con.close()
@@ -497,7 +555,8 @@ def login_form():
     return render("login.html", error=None)
 
 @app.post("/login")
-def login_submit(username: str = Form(...), password: str = Form(...)):
+def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    _limit_auth(request, "password")
     con = db()
     admin = get_admin(con)
     if not admin or admin["username"] != username or \
@@ -527,11 +586,15 @@ def twofa_form(request: Request):
 
 @app.post("/2fa")
 def twofa_submit(request: Request, code: str = Form(...)):
+    _limit_auth(request, "mfa")
     token = request.cookies.get(COOKIE)
     con = db()
+    con.execute("BEGIN IMMEDIATE")
     s = current_session(con, token); admin = get_admin(con)
     if not s:
         con.close(); return RedirectResponse("/login", 303)
+    if not admin or not admin["totp_enabled"]:
+        con.close(); return RedirectResponse("/2fa/enroll", 303)
     ok = sec.verify_totp(admin["totp_secret"], code)
     if not ok:
         # try recovery code
@@ -549,9 +612,16 @@ def twofa_submit(request: Request, code: str = Form(...)):
 @app.get("/2fa/enroll", response_class=HTMLResponse)
 def enroll_form(request: Request):
     token = request.cookies.get(COOKIE)
-    con = db(); s = current_session(con, token); admin = get_admin(con)
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    s = current_session(con, token); admin = get_admin(con)
     if not s:
         con.close(); return RedirectResponse("/login", 303)
+    # Enrollment is a one-time transition. A password-only session must never
+    # reveal the existing second factor, even by directly visiting this URL.
+    if admin["totp_enabled"]:
+        con.close()
+        return RedirectResponse("/" if s["mfa_passed"] else "/2fa", 303)
     # generate a secret if none pending
     secret = admin["totp_secret"] or sec.new_totp_secret()
     if not admin["totp_secret"]:
@@ -563,10 +633,18 @@ def enroll_form(request: Request):
 
 @app.post("/2fa/enroll")
 def enroll_submit(request: Request, code: str = Form(...)):
+    _limit_auth(request, "mfa")
     token = request.cookies.get(COOKIE)
-    con = db(); s = current_session(con, token); admin = get_admin(con)
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    s = current_session(con, token); admin = get_admin(con)
     if not s:
         con.close(); return RedirectResponse("/login", 303)
+    if admin["totp_enabled"]:
+        con.close()
+        raise HTTPException(409, "Two-factor authentication is already enrolled")
+    if not admin["totp_secret"]:
+        con.close(); return RedirectResponse("/2fa/enroll", 303)
     if not sec.verify_totp(admin["totp_secret"], code):
         uri = sec.totp_uri(admin["totp_secret"], admin["username"])
         con.close()
@@ -607,25 +685,53 @@ def dashboard(request: Request, user: str = Depends(require_user)):
 
 
 class Concept(BaseModel):
-    name: str
-    terms: list[str] = []
-    mesh: list[str] = []
+    name: str = Field(min_length=1)
+    terms: list[str] = Field(default_factory=list)
+    mesh: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_concept(self):
+        if not self.name.strip() or not any(x.strip() for x in self.terms + self.mesh):
+            raise ValueError("Each concept needs a name and at least one term or MeSH heading")
+        if any(not x.strip() for x in self.terms + self.mesh):
+            raise ValueError("Concept terms cannot be blank")
+        return self
+
 
 class Question(BaseModel):
-    id: str
-    label: str
-    concepts: list[Concept]
-    study_filter: list[str] = []
-    from_days_back: int = 7
-    enabled: bool = True
-    sources: dict = {}                 # {source: bool}
-    api_keys: dict = {}                # {source: plaintext key} — write-only
-    delivery: list[str] = ["file"]
-    email_enabled: bool = False
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$", max_length=128)
+    label: str = Field(min_length=1)
+    concepts: list[Concept] = Field(min_length=1)
+    study_filter: list[str] = Field(default_factory=list)
+    from_days_back: int = Field(default=7, ge=1, strict=True)
+    enabled: StrictBool = True
+    sources: dict[str, StrictBool] = Field(default_factory=dict)
+    api_keys: dict[str, StrictStr] = Field(default_factory=dict)
+    delivery: list[Literal["file", "zotero"]] = Field(default_factory=lambda: ["file"])
+    email_enabled: StrictBool = False
     email_cron: str = "0 7 * * 1"
-    email_to: list[str] = []
-    digest_mode: str = "all"           # 'all' | 'threshold'
-    min_score: float = 0.0
+    email_to: list[str] = Field(default_factory=list)
+    digest_mode: Literal["all", "threshold"] = "all"
+    min_score: float = Field(default=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_question(self):
+        if not self.label.strip():
+            raise ValueError("Question label cannot be blank")
+        for values, known, label in ((self.sources, SOURCES, "source"),
+                                     (self.api_keys, SOURCES_WITH_KEYS, "API key source")):
+            unknown = set(values) - set(known)
+            if unknown:
+                raise ValueError(f"Unknown {label}: {', '.join(sorted(unknown))}")
+        if len(self.email_cron.split()) != 5 or not croniter.is_valid(self.email_cron):
+            raise ValueError("email_cron must be a valid five-field cron expression")
+        if self.email_enabled and not self.email_to:
+            raise ValueError("Email delivery requires at least one recipient")
+        for address in self.email_to:
+            if (not address.strip() or "@" not in address or
+                    any(c.isspace() or ord(c) < 32 for c in address)):
+                raise ValueError("Each email recipient must be one address without whitespace")
+        return self
 
 
 # ============================================================
@@ -652,10 +758,14 @@ def _norm_title(x: str) -> str:
     return x.strip()
 
 def _record_dedup_key(doi: str, title: str, year: str) -> str:
-    # EXACT mirror of R .collapse_batch key: doi:<n> else ti:<title>|<year>
+    # Mirror R .collapse_batch. Preserve non-ASCII scientific distinctions
+    # (e.g. alpha/beta symbols) instead of stripping them into the same key.
     dn = _norm_doi(doi)
     if dn:
         return f"doi:{dn}"
+    if any(ord(c) > 127 for c in (title or "")):
+        exact_title = _re.sub(r"[ \t\r\n]+", " ", title).strip(" ")
+        return f"tiu:{exact_title}|{year or ''}"
     return f"ti:{_norm_title(title)}|{year or ''}"
 
 def _signal_dedup_key(source: str, ext_id: str) -> str:
@@ -675,6 +785,28 @@ def require_ingest_token(request: Request):
         raise HTTPException(401, "Invalid or missing ingest token")
     return True
 
+
+def _normalize_ingest_date(value):
+    """Store date fields in one sortable calendar form, as the R writer does."""
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        if _re.fullmatch(r"[0-9]{4}", value):
+            return date(int(value), 1, 1).isoformat()
+        if _re.fullmatch(r"[0-9]{4}[-/][0-9]{1,2}", value):
+            year, month = _re.split(r"[-/]", value)
+            return date(int(year), int(month), 1).isoformat()
+        if _re.fullmatch(r"[0-9]{8}", value):
+            return datetime.strptime(value, "%Y%m%d").date().isoformat()
+        if _re.fullmatch(r"[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}", value):
+            return date(*(int(part) for part in value.split("/"))).isoformat()
+        if len(value) == 10:
+            return date.fromisoformat(value).isoformat()
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError as exc:
+        raise ValueError("Date must be a valid ISO date/timestamp, YYYYMMDD, year or year-month") from exc
+
 class IngestRecord(BaseModel):
     question_id: str
     title: str
@@ -689,7 +821,12 @@ class IngestRecord(BaseModel):
     type: str = ""                  # raw publication-type hint, if any
     study_type: str = ""            # optional producer-supplied hint; '' -> 'unclassified'
     is_preprint: int = 0
-    score: float = 0.0
+    score: float = Field(default=0.0, allow_inf_nan=False)
+
+    @field_validator("pub_date")
+    @classmethod
+    def normalize_date(cls, value):
+        return _normalize_ingest_date(value)
 
 VALID_CONFIDENCE = {"authoritative", "reported", "unverified"}
 INGEST_MAX_SCORE = 10.0   # posted scores are capped; R rescoring is canonical
@@ -706,7 +843,55 @@ class IngestSignal(BaseModel):
     url: str = ""
     confidence: str = "reported"    # authoritative|reported|unverified
     extra: dict = {}
-    score: float = 0.0
+    score: float = Field(default=0.0, allow_inf_nan=False)
+
+    @field_validator("signal_date")
+    @classmethod
+    def normalize_date(cls, value):
+        return _normalize_ingest_date(value)
+
+
+def _same_json(left, right):
+    # Python considers True == 1; JSON and R preserve that type distinction.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (isinstance(left, dict) and isinstance(right, dict)
+                and left.keys() == right.keys()
+                and all(_same_json(left[key], right[key]) for key in left))
+    if isinstance(left, list) or isinstance(right, list):
+        return (isinstance(left, list) and isinstance(right, list)
+                and len(left) == len(right)
+                and all(_same_json(a, b) for a, b in zip(left, right)))
+    return left == right
+
+
+def _signal_revision_key(con, base, question_id, values):
+    """Preserve changed signals as append-only events, shared with the R writer."""
+    prefix = base + ":revision:"
+    previous = con.execute(
+        "SELECT * FROM signals WHERE question_id=? AND "
+        "(dedup_key=? OR substr(dedup_key,1,?)=?)",
+        (question_id, base, len(prefix), prefix)).fetchall()
+    fields = ("source", "ext_id", "signal_type", "title", "summary", "org",
+              "signal_date", "url", "confidence")
+    for row in previous:
+        if not all(str(row[field] or "") == str(values.get(field) or "") for field in fields):
+            continue
+        try:
+            same_extra = _same_json(json.loads(row["extra"] or "{}"), values["extra"])
+        except (ValueError, TypeError):
+            same_extra = False
+        if same_extra:
+            return None
+    used = {row["dedup_key"] for row in previous}
+    if base not in used:
+        return base
+    revision = 1
+    while prefix + str(revision) in used:
+        revision += 1
+    return prefix + str(revision)
+
 
 class IngestPayload(BaseModel):
     records: list[IngestRecord] = []
@@ -716,7 +901,10 @@ class IngestPayload(BaseModel):
 def ingest(payload: IngestPayload, request: Request, _: bool = Depends(require_ingest_token)):
     con = db()
     try:
-        valid_q = {r["id"] for r in con.execute("SELECT id FROM questions")}
+        con.execute("BEGIN IMMEDIATE")
+        question_channels = {r["id"]: r["delivery"]
+                             for r in con.execute("SELECT id,delivery FROM questions")}
+        valid_q = set(question_channels)
         rec_new = rec_dup = sig_new = sig_dup = 0
         skipped = []
 
@@ -740,6 +928,14 @@ def ingest(payload: IngestPayload, request: Request, _: bool = Depends(require_i
                  r.authors, r.journal, r.pub_date, r.url, r.oa_url, r.type,
                  r.study_type or "unclassified", int(r.is_preprint),
                  min(float(r.score), INGEST_MAX_SCORE)))
+            # Queue alongside the record. A failure rolls both back, and an
+            # identical ingestion retry cannot replay previously seen records.
+            channels = json.loads(question_channels[r.question_id] or "[]")
+            for channel in ("file", "zotero"):
+                if channel in channels:
+                    con.execute("INSERT OR IGNORE INTO delivery_outbox"
+                                "(channel,question_id,dedup_key) VALUES(?,?,?)",
+                                (channel, r.question_id, key))
             rec_new += 1
 
         for s in payload.signals:
@@ -754,11 +950,10 @@ def ingest(payload: IngestPayload, request: Request, _: bool = Depends(require_i
                 skipped.append({"title": s.title[:60],
                                 "reason": f"invalid confidence '{s.confidence}'"})
                 continue
-            key = _signal_dedup_key(s.source, s.ext_id or s.url or s.title)
-            exists = con.execute(
-                "SELECT 1 FROM signals WHERE dedup_key=? AND question_id=?",
-                (key, s.question_id)).fetchone()
-            if exists:
+            s.ext_id = s.ext_id or s.url or s.title
+            base = _signal_dedup_key(s.source, s.ext_id)
+            key = _signal_revision_key(con, base, s.question_id, s.model_dump())
+            if key is None:
                 sig_dup += 1
                 continue
             con.execute("""INSERT INTO signals(dedup_key,question_id,signal_type,source,
@@ -767,7 +962,7 @@ def ingest(payload: IngestPayload, request: Request, _: bool = Depends(require_i
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),0)""",
                 (key, s.question_id, s.signal_type, s.source, s.ext_id, s.title,
                  s.summary, s.org, s.signal_date, s.url, s.confidence,
-                 json.dumps(s.extra), min(float(s.score), INGEST_MAX_SCORE)))
+                 json.dumps(s.extra, sort_keys=True), min(float(s.score), INGEST_MAX_SCORE)))
             sig_new += 1
 
         con.commit()
@@ -891,7 +1086,7 @@ API = Depends(require_api_token)
 RECORD_FIELDS = ["dedup_key", "question_id", "source", "ext_id", "doi", "title",
                  "abstract", "authors", "journal", "pub_date", "url", "oa_url",
                  "type", "study_type", "is_preprint", "score", "first_seen",
-                 "emailed"]
+                 "emailed", "provenance"]
 SIGNAL_FIELDS = ["dedup_key", "question_id", "signal_type", "source", "ext_id",
                  "title", "summary", "org", "signal_date", "url", "confidence",
                  "extra", "score", "first_seen", "emailed"]
@@ -974,7 +1169,7 @@ def v1_records(question_id: str, study_type: str | None = None,
                             params).fetchone()["c"]
         rows = con.execute(
             f"SELECT {','.join(RECORD_FIELDS)} FROM records WHERE {clause} "
-            f"ORDER BY first_seen DESC, score DESC LIMIT ? OFFSET ?",
+            f"ORDER BY first_seen DESC, score DESC, dedup_key ASC LIMIT ? OFFSET ?",
             (*params, limit, offset)).fetchall()
         return {"total": total, "limit": limit, "offset": offset,
                 "records": [dict(r) for r in rows]}
@@ -1008,7 +1203,7 @@ def v1_signals(question_id: str, signal_type: str | None = None,
                             params).fetchone()["c"]
         rows = con.execute(
             f"SELECT {','.join(SIGNAL_FIELDS)} FROM signals WHERE {clause} "
-            f"ORDER BY signal_date DESC, score DESC LIMIT ? OFFSET ?",
+            f"ORDER BY signal_date DESC, score DESC, dedup_key ASC LIMIT ? OFFSET ?",
             (*params, limit, offset)).fetchall()
         return {"total": total, "limit": limit, "offset": offset,
                 "signals": [dict(r) for r in rows]}

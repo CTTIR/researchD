@@ -33,10 +33,10 @@ cases <- list(
   list("pubmed", "Editorial", "Lancet",
        "The MASH decade", "other", 0, "editorial tag"),
   list("pubmed", "Journal Article", "Hepatology",
-       "Hepatic fat fraction and fibrosis markers", "observational", 0,
-       "generic tag + no title signal -> observational, not 'other'"),
+       "Hepatic fat fraction and fibrosis markers", "unclassified", 0,
+       "generic tag alone does not establish a study design"),
   list("pubmed", "Journal Article; Research Support, Non-U.S. Gov't", "Hepatology",
-       "Serum proteomics in steatohepatitis", "observational", 0,
+       "Serum proteomics in steatohepatitis", "unclassified", 0,
        "generic tags only"),
 
   # --- title heuristic (no usable tag) ---
@@ -84,7 +84,7 @@ cases <- list(
        "Newsletter of hepatic imaging", "other", 0,
        "'newsletter' still does match, deliberately"),
   list("europepmc", "Journal Article", "Research Square",
-       "Liver fibrosis staging by MRE", "observational", 1,
+       "Liver fibrosis staging by MRE", "unclassified", 1,
        "preprint detected from the journal name, not the source"),
 
   # --- ClinicalTrials.gov special case ---

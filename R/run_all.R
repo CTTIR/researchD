@@ -35,6 +35,11 @@ source("R/10_pharma_intel.R")
 
 settings <- yaml::read_yaml("config/settings.yaml")
 
+# Full, fast-lane and manual invocations share delivery state. A process-level
+# lock prevents duplicate external delivery and overlapping read/write cycles.
+pipeline_lock <- filelock::lock(paste0(settings$paths$db, ".pipeline.lock"), timeout = 0)
+if (is.null(pipeline_lock)) stop("Another pipeline run is active for this database")
+
 con <- DBI::dbConnect(RSQLite::SQLite(), settings$paths$db)
 DBI::dbExecute(con, "PRAGMA journal_mode=WAL;")
 DBI::dbExecute(con, "PRAGMA busy_timeout=10000;")  # wait out web-read locks
@@ -43,10 +48,10 @@ on.exit(DBI::dbDisconnect(con), add = TRUE)
 db_init_schema(con, "db/schema.sql")
 seed_questions_from_yaml(con, "config/questions.yaml")  # no-op if DB already populated
 
-questions <- load_questions_db(con)
 sel <- commandArgs(trailingOnly = TRUE)
-if (length(sel)) questions <- Filter(function(q) q$id %in% sel, questions)
-if (length(questions) == 0) stop("No matching enabled questions to run.")
+questions <- load_questions_db(con, selected_ids = sel)
+load_errors <- attr(questions, "load_errors") %||% list()
+if (length(questions) == 0 && !length(load_errors)) stop("No matching enabled questions to run.")
 
 run_date <- format(Sys.Date(), "%Y-%m-%d")
 per_question <- list()
@@ -58,6 +63,7 @@ per_question <- list()
 #   signals       : signals only    — hourly fast lane
 #   lit           : literature only
 run_mode <- Sys.getenv("RUN_MODE", "all")
+if (!run_mode %in% c("all", "lit", "signals")) stop("RUN_MODE must be all, lit, or signals")
 do_lit <- run_mode %in% c("all", "lit")
 do_sig <- run_mode %in% c("all", "signals")
 
@@ -66,19 +72,23 @@ do_sig <- run_mode %in% c("all", "signals")
 # enrichment, the signals block -- was unguarded, so a single malformed
 # question could abort the whole cycle and silently starve every question
 # after it in the loop. ACCEPTANCE C3 requires the opposite.
-n_failed <- 0L
-failed_ids <- character(0)
+n_failed <- length(load_errors)
+failed_ids <- names(load_errors) %||% character(0)
 
 for (q in questions) {
   message("\n=== ", q$label, " (", q$id, ") ===")
   per_q <- tryCatch({
   new <- data.frame()
+  degraded_sources <- character(0)
   if (do_lit) {
   # --- literature track ---
   queries <- build_all_queries(q)
   raw     <- fetch_question(q, queries, settings)
   message("  [lit] fetched ", nrow(raw), " raw records")
-  log_fetch(con, q$id, "lit", attr(raw, "source_counts"))
+  counts <- attr(raw, "source_counts")
+  log_fetch(con, q$id, "lit", counts)
+  degraded_sources <- c(degraded_sources, names(Filter(function(x) !isTRUE(x$ok), counts)))
+  raw     <- .collapse_batch(raw, settings$ranking$source_priority)
   raw     <- classify_study_type(raw)
   ranked  <- rank_records(raw, q, settings)
   new     <- persist_records(con, ranked, q$id, settings$ranking$source_priority)
@@ -90,25 +100,34 @@ for (q in questions) {
   update_oa_urls(con, new, q$id)
   # reclassify (and rescore) records that arrived via /api/ingest (external ingestion)
   n_recl <- reclassify_unclassified(con, q$id, q, settings)
-  if (n_recl > 0) message("  [lit] reclassified ", n_recl, " ingested record(s)")
+  if (n_recl > 0) message("  [lit] refreshed classification/ranking for ", n_recl, " record(s)")
   }
 
   # --- signals track (parallel) ---
-  sigcfg  <- load_signal_config(con, q$id)
   sig_new <- data.frame()
-  if (do_sig && (length(sigcfg$sources) || length(sigcfg$scrape_targets))) {
+  if (do_sig) {
+  sigcfg <- load_signal_config(con, q$id)
+  if (length(sigcfg$sources) || length(sigcfg$scrape_targets) || length(sigcfg$feed_categories)) {
     # merge decrypted signal keys into settings for the fetchers
     s_sig <- settings
     s_sig$signal_keys <- sigcfg$api_keys
     sig_raw <- fetch_signals(q, sigcfg, s_sig)
     message("  [sig] fetched ", nrow(sig_raw), " raw signals")
-    log_fetch(con, q$id, "signals", attr(sig_raw, "source_counts"))
+    counts <- attr(sig_raw, "source_counts")
+    log_fetch(con, q$id, "signals", counts)
+    degraded_sources <- c(degraded_sources, names(Filter(function(x) !isTRUE(x$ok), counts)))
     sig_rank <- rank_signals(sig_raw, q, settings)
     sig_new  <- persist_signals(con, sig_rank, q$id)
     sig_new  <- rank_signals(sig_new, q, settings)
     message("  [sig] ", nrow(sig_new), " new signals after dedup/state")
   }
+  }
 
+  if (length(degraded_sources)) {
+    n_failed <- n_failed + 1L
+    failed_ids <- c(failed_ids, q$id)
+    message("  [WARN] incomplete sources: ", paste(unique(degraded_sources), collapse = ", "))
+  }
   list(label = q$label, recs = new, signals = sig_new, delivery = q$delivery)
   }, error = function(e) {
     n_failed <<- n_failed + 1L
@@ -125,19 +144,23 @@ for (q in questions) {
 # instant-alert/digest email; rewriting digest files hourly would clobber
 # the daily digest with near-empty ones.
 if (run_mode != "signals") {
-html <- render_digest_html(per_question, run_date)
-md   <- render_digest_md(per_question, run_date)
-
-# Email is now handled per-question by the scheduler service (web/scheduler.py),
-# which respects each question's own cadence + recipient list. The R engine
-# only writes file/zotero outputs here to avoid double-sending.
-all_channels <- unique(unlist(lapply(per_question, `[[`, "delivery")))
-if ("file" %in% all_channels)  deliver_file(html, md, settings, run_date)
-if ("zotero" %in% all_channels) {
-  for (id in names(per_question)) {
-    qd <- per_question[[id]]
-    if ("zotero" %in% qd$delivery) deliver_zotero(qd$recs, id, settings)
-  }
+# Delivery is independent of whether a fresh source fetch succeeded. Pending
+# rows from an earlier cycle or /api/ingest remain eligible for retry.
+tryCatch(deliver_pending_files(con, questions, settings, run_date), error = function(e) {
+  n_failed <<- n_failed + 1L
+  failed_ids <<- c(failed_ids, "file delivery")
+  message("  [ERROR] file delivery: ", conditionMessage(e))
+})
+for (q in questions) {
+  if (!"zotero" %in% q$delivery) next
+  tryCatch({
+    delivered <- deliver_zotero(data.frame(), q$id, settings, con = con)
+    if (!isTRUE(delivered)) stop("Zotero delivery is disabled; records remain queued")
+  }, error = function(e) {
+    n_failed <<- n_failed + 1L
+    failed_ids <<- c(failed_ids, paste0(q$id, ":zotero"))
+    message("  [ERROR] Zotero delivery for ", q$id, ": ", conditionMessage(e))
+  })
 }
 }
 
@@ -153,11 +176,15 @@ message("\nDone. ", summary_line)
 # records last_run without advancing last_ok.
 heartbeat(con, "pipeline", ok = (n_failed == 0L),
           detail = paste0("mode=", run_mode, "; ", summary_line),
-          error = if (n_failed) paste("failed:", paste(failed_ids, collapse = ", ")) else "")
+          error = if (n_failed) paste0("failed: ", paste(failed_ids, collapse = ", "),
+            if (length(load_errors)) paste0("; unloadable: ",
+              paste(paste(names(load_errors), unlist(load_errors, use.names = FALSE), sep = ": "),
+                    collapse = "; ")) else "") else "")
 
 # Keep the write-ahead log from growing without bound between restarts. The
 # three services share one SQLite file, so nothing else checkpoints it.
 invisible(tryCatch(DBI::dbGetQuery(con, "PRAGMA wal_checkpoint(TRUNCATE);"),
                    error = function(e) NULL))
+filelock::unlock(pipeline_lock)
 
 if (n_failed > 0L) quit(status = 1L)

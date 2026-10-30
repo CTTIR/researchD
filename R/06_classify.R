@@ -31,14 +31,13 @@
 .TAG_TO_BUCKET <- list(
   systematic_review = c("systematic review", "meta-analysis",
                         "systematic review and meta-analysis"),
-  rct               = c("randomized controlled trial",
-                        "controlled clinical trial",
-                        "pragmatic clinical trial",
-                        "equivalence trial", "adaptive clinical trial"),
+  rct               = c("randomized controlled trial"),
   clinical_trial    = c("clinical trial", "clinical trial, phase i",
                         "clinical trial, phase ii", "clinical trial, phase iii",
                         "clinical trial, phase iv", "clinical trial protocol",
-                        "controlled trial", "multicenter study"),
+                        "controlled trial", "controlled clinical trial",
+                        "pragmatic clinical trial", "equivalence trial",
+                        "adaptive clinical trial"),
   guideline         = c("guideline", "practice guideline",
                         "consensus development conference",
                         "consensus development conference, nih"),
@@ -85,7 +84,8 @@
 
   if (grepl("systematic review|meta-analysis|meta analysis|metaanalysis|cochrane", ti))
     return("systematic_review")
-  if (grepl("randomi[sz]ed controlled trial|randomi[sz]ed clinical trial|randomi[sz]ed trial|randomi[sz]ed study|randomi[sz]ed,? (double|single|open|placebo)|\\brct\\b|controlled clinical trial|random allocation|randomly assigned|double-blind|placebo-controlled", ti))
+  if (!grepl("non[- ]?randomi[sz]ed|not randomi[sz]ed", ti) &&
+      grepl("randomi[sz]ed controlled trial|randomi[sz]ed clinical trial|randomi[sz]ed trial|randomi[sz]ed study|randomi[sz]ed,? (double|single|open|placebo)|\\brct\\b|random allocation|randomly assigned", ti))
     return("rct")
   if (grepl("clinical trial|\\btrial\\b|phase (i{1,3}v?|[1-4])\\b|interventional|single-arm|open-label", ti))
     return("clinical_trial")
@@ -137,12 +137,9 @@
   by_text <- .classify_from_text(s, title)
   if (nzchar(by_text)) return(by_text)
 
-  # 3. If the record had a generic tag but no title signal, it's a real
-  #    article we just can't sub-classify -> observational (primary research)
-  #    is a safer default than "other" for journal articles.
-  if (identical(by_tag, "generic")) return("observational")
-
-  # 4. No tag, no title signal -> recall safety net.
+  # A generic Journal Article tag does not establish a study design (it can
+  # describe laboratory, animal, methods, or clinical research). Preserve
+  # that uncertainty instead of manufacturing an observational classification.
   "unclassified"
 }
 

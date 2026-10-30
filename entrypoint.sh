@@ -15,13 +15,14 @@ FAST_SCHEDULE="${CRON_FAST_SCHEDULE:-15 * * * *}" # signals lane: hourly at :15
 
 # 1. persist env so the cron job can source it (filter to what we need).
 # APP_SECRET_KEY must be here: cron jobs inherit nothing, and without it
-# web/decrypt_key.py silently returns "" for every per-question API key,
-# so scheduled runs would quietly fetch unauthenticated.
+# configured credentials cannot be decrypted and the affected questions fail
+# visibly. Export the matching key so scheduled runs can authenticate.
 # The file holds secrets -> create it 0600 before anything is written.
 umask 077
 : > /app/.cron_env
-printenv | grep -E '^(APP_SECRET_KEY|EMAIL_PW|ZOTERO_KEY|ENTREZ_KEY|TZ|CONTACT_EMAIL)=' \
-  >> /app/.cron_env || true
+# Quote every value as shell data, including spaces, quotes and newlines. Plain
+# printenv output is not shell syntax and unexported assignments never reach R.
+python3 /app/scripts/write_cron_env.py /app/.cron_env
 chmod 600 /app/.cron_env
 umask 022
 
@@ -43,7 +44,7 @@ echo "[entrypoint] schedule: ${SCHEDULE}  (TZ=${TZ:-UTC})"
 # 3. optional immediate run (handy for first-run / testing)
 if [ "${RUN_ON_START:-0}" = "1" ]; then
   echo "[entrypoint] RUN_ON_START=1 -> running once now"
-  set -a; . /app/.cron_env 2>/dev/null || true; set +a
+  . /app/.cron_env
   Rscript /app/R/run_all.R || echo "[entrypoint] initial run exited non-zero"
 fi
 

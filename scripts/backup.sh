@@ -25,40 +25,65 @@ DB="${1:?usage: backup.sh <db-path> <backup-dir> [keep]}"
 DIR="${2:?usage: backup.sh <db-path> <backup-dir> [keep]}"
 KEEP="${3:-14}"
 
-[ -f "$DB" ] || { echo "backup.sh: no such database: $DB" >&2; exit 1; }
-mkdir -p "$DIR"
-STAMP=$(date +%Y%m%d-%H%M%S)
-OUT="$DIR/pipeline-$STAMP.sqlite"
+# Python's SQLite backup API also handles quotes and URI punctuation in paths.
+python3 - "$DB" "$DIR" "$KEEP" <<'PY'
+from datetime import datetime
+from pathlib import Path
+import os
+import re
+import sqlite3
+import sys
+import tempfile
 
-# Prefer the sqlite3 CLI; fall back to Python's sqlite3 module, which exposes
-# the same backup API. Neither the rocker nor the python-slim image ships the
-# CLI, and plenty of hosts do not either, so the fallback is the common path.
-if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$DB" ".backup '$OUT'"
-elif command -v python3 >/dev/null 2>&1; then
-  python3 - "$DB" "$OUT" <<'PY'
-import sqlite3, sys
-src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-dst = sqlite3.connect(sys.argv[2])
-with dst:
-    src.backup(dst)          # consistent snapshot, WAL and all
-dst.close(); src.close()
+if not re.fullmatch(r"[0-9]+", sys.argv[3]) or int(sys.argv[3]) < 1:
+    raise SystemExit("backup.sh: keep must be a positive integer")
+keep = int(sys.argv[3])
+source = Path(sys.argv[1]).resolve()
+directory = Path(sys.argv[2])
+if not source.is_file():
+    raise SystemExit(f"backup.sh: no such database: {source}")
+directory.mkdir(parents=True, exist_ok=True)
+stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+fd, temporary = tempfile.mkstemp(prefix=f".pipeline-{stamp}-", suffix=".tmp", dir=directory)
+os.close(fd)
+temporary = Path(temporary)
+output = temporary.with_name(temporary.name[1:-4] + ".sqlite")
+try:
+    src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=30)
+    dst = sqlite3.connect(temporary, timeout=30)
+    try:
+        try:
+            src.backup(dst)
+        except sqlite3.OperationalError as error:
+            if (getattr(error, "sqlite_errorcode", None) != getattr(sqlite3, "SQLITE_CANTOPEN", 14)
+                    and "unable to open database file" not in str(error).lower()):
+                raise
+            # A checkpointed WAL-mode file may have no sidecars yet. SQLite
+            # needs a writable handle to create them, even for a read-only
+            # backup. Query-only mode prevents logical writes; mode=rw cannot
+            # accidentally create a missing source database.
+            src.close()
+            src = sqlite3.connect(source.as_uri() + "?mode=rw", uri=True, timeout=30)
+            src.execute("PRAGMA query_only=ON")
+            src.backup(dst)
+        dst.execute("PRAGMA journal_mode=DELETE")
+        result = [r[0] for r in dst.execute("PRAGMA integrity_check")]
+        if result != ["ok"]:
+            raise RuntimeError("backup integrity check failed: " + "; ".join(result))
+    finally:
+        dst.close()
+        src.close()
+    # Only complete verified snapshots participate in retention. Random suffixes
+    # preserve distinct snapshots even when two backups start in the same second.
+    os.replace(temporary, output)
+finally:
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(temporary) + suffix).unlink(missing_ok=True)
+
+snapshots = [p for p in directory.glob("pipeline-*.sqlite")
+             if p.is_file() and p.resolve() not in (source, output.resolve())]
+snapshots.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+for old in snapshots[keep - 1:]:
+    old.unlink(missing_ok=True)
+print(f"backup ok: {output} ({output.stat().st_size} bytes, integrity_check=ok)")
 PY
-else
-  echo "backup.sh: need either sqlite3 or python3 on PATH" >&2
-  exit 1
-fi
-
-# Verify the snapshot before trusting it -- a backup you have not read is a
-# hope, not a backup.
-if command -v sqlite3 >/dev/null 2>&1; then
-  RESULT=$(sqlite3 "$OUT" "PRAGMA integrity_check;")
-else
-  RESULT=$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGMA integrity_check').fetchone()[0])" "$OUT")
-fi
-[ "$RESULT" = "ok" ] || { echo "backup.sh: integrity check FAILED: $RESULT" >&2; rm -f "$OUT"; exit 1; }
-
-# Retain the newest $KEEP snapshots.
-ls -1t "$DIR"/pipeline-*.sqlite 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm --
-
-echo "backup ok: $OUT ($(wc -c < "$OUT") bytes, integrity_check=$RESULT)"

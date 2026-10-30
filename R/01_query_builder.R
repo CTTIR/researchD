@@ -22,12 +22,14 @@
 # Free text searched in [tiab] (title/abstract); MeSH in [MeSH Terms].
 build_pubmed <- function(q, from_days_back = NULL) {
   concept_blocks <- vapply(q$concepts, function(con) {
-    tiab <- paste0(.quote_if_phrase(con$terms), "[tiab]")
+    terms <- con$terms %||% character(0)
+    terms <- terms[!is.na(terms) & nzchar(trimws(terms))]
+    tiab <- if (length(terms)) paste0(.quote_if_phrase(terms), "[tiab]") else character(0)
     mesh <- if (!is.null(con$mesh) && length(con$mesh))
       paste0(.quote_if_phrase(con$mesh), "[MeSH Terms]") else character(0)
     .or_join(c(tiab, mesh))
   }, character(1))
-  query <- paste(concept_blocks, collapse = " AND ")
+  query <- paste(concept_blocks[nzchar(concept_blocks)], collapse = " AND ")
 
   if (length(q$study_filter)) {
     pts <- .or_join(paste0(.quote_if_phrase(q$study_filter), "[Publication Type]"))

@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS records (
   pub_date    TEXT,
   url         TEXT,
   oa_url      TEXT,                        -- free open-access full-text (Unpaywall), if any
+  provenance  TEXT DEFAULT '[]',           -- source identities and fields used in metadata merging
   type        TEXT,
   study_type  TEXT,
   is_preprint INTEGER DEFAULT 0,
@@ -76,6 +77,23 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS idx_records_q_date ON records(question_id, pub_date DESC);
 CREATE INDEX IF NOT EXISTS idx_records_q_seen ON records(question_id, first_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_records_q_emailed ON records(question_id, emailed);
+
+-- Durable delivery state. Only new records are queued when Zotero delivery is
+-- enabled; upgrading must not replay an existing library's historical records.
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+  channel     TEXT NOT NULL,
+  question_id TEXT NOT NULL,
+  dedup_key   TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'pending',
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT DEFAULT '',
+  remote_key  TEXT DEFAULT '',
+  destination TEXT DEFAULT '',
+  updated_at  TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (channel, question_id, dedup_key),
+  FOREIGN KEY (dedup_key, question_id) REFERENCES records(dedup_key, question_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(channel, state, question_id);
 
 -- ============================================================
 -- SIGNALS TRACK — parallel to records, for non-paper intelligence.

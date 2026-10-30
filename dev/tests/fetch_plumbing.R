@@ -134,15 +134,21 @@ ok("a token encrypted with the right key round-trips",
 wrong <- system2("python3", c("-c",
   "'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"), stdout = TRUE)
 Sys.setenv(APP_SECRET_KEY = wrong)
-got <- .decrypt_key(token)
-ok("a WRONG master key degrades to \"\" and does not crash", identical(got, ""), got)
-ok("a wrong key never leaks ciphertext into the result", !grepl("gAAAAA", got))
+got <- tryCatch(.decrypt_key(token), error = identity)
+ok("a WRONG master key fails visibly", inherits(got, "error") &&
+   grepl("Cannot decrypt configured API key", conditionMessage(got), fixed = TRUE))
+ok("a wrong key never leaks ciphertext or credentials", inherits(got, "error") &&
+   !any(vapply(c(token, key, wrong, "SECRET-API-KEY"), function(value)
+     grepl(value, conditionMessage(got), fixed = TRUE), logical(1))))
 
 Sys.setenv(APP_SECRET_KEY = "")
-ok("a MISSING master key degrades to \"\"", identical(.decrypt_key(token), ""))
+got <- tryCatch(.decrypt_key(token), error = identity)
+ok("a MISSING master key reports the required setting", inherits(got, "error") &&
+   grepl("APP_SECRET_KEY is missing", conditionMessage(got), fixed = TRUE))
 Sys.setenv(APP_SECRET_KEY = key)
 ok("an empty token short-circuits to \"\"", identical(.decrypt_key(""), ""))
-ok("a garbage token degrades to \"\"", identical(.decrypt_key("not-a-fernet-token"), ""))
+ok("a garbage token fails visibly", inherits(tryCatch(
+   .decrypt_key("not-a-fernet-token"), error = identity), "error"))
 
 cat("\n", if (fail == 0L) "ALL FETCH-PLUMBING CHECKS PASSED" else paste(fail, "FAILURE(S)"), "\n", sep = "")
 

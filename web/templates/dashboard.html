@@ -28,15 +28,16 @@
     <section class="card">
       <h2 id="editorTitle">New search</h2>
 
-      <label>ID (slug)</label>
-      <input id="qid" placeholder="glp1_mash">
-      <label>Label</label>
+      <label for="qid">ID (slug)</label>
+      <input id="qid" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" maxlength="128" aria-label="Search ID" placeholder="glp1_mash">
+      <label for="qlabel">Label</label>
       <input id="qlabel" placeholder="GLP-1 agonists for MASH/NASH">
 
       <div class="grid2">
-        <div><label>Lookback (days)</label><input id="qdays" type="number" value="7"></div>
-        <div><label>Enabled</label>
-          <select id="qenabled"><option value="true">yes</option><option value="false">no</option></select></div>
+        <div><label for="qdays">Lookback (days)</label>
+      <input id="qdays" type="number" min="1" step="1" value="7"></div>
+        <div><label for="qenabled">Enabled</label>
+      <select id="qenabled"><option value="true">yes</option><option value="false">no</option></select></div>
       </div>
 
       <!-- SOURCES (per-question) -->
@@ -71,8 +72,8 @@
         feed + email</em> — the high-signal stream.</p>
       <div class="grid2">
         <div>
-          <label>Mode</label>
-          <select id="digestMode">
+          <label for="digestMode">Mode</label>
+      <select id="digestMode">
             <option value="all">show all (max recall)</option>
             <option value="threshold">threshold (score cutoff)</option>
           </select>
@@ -95,8 +96,8 @@
       </div>
       <div class="grid2" style="margin-top:8px">
         <div>
-          <label>Min confidence (digest/feed)</label>
-          <select id="sigMinConf">
+          <label for="sigMinConf">Min confidence (digest/feed)</label>
+      <select id="sigMinConf">
             <option value="unverified">unverified (everything)</option>
             <option value="reported">reported</option>
             <option value="authoritative">authoritative only</option>
@@ -137,16 +138,16 @@
       <h3>Email distribution</h3>
       <label class="inline"><input type="checkbox" id="emailEnabled"> send this search by email</label>
       <div id="emailBlock" class="subblock" style="display:none">
-        <label>Frequency (cron expression)</label>
-        <input id="emailCron" value="0 7 * * 1">
+        <label for="emailCron">Frequency (cron expression)</label>
+      <input id="emailCron" value="0 7 * * 1">
         <p class="muted small" id="cronHuman"></p>
         <div class="cronpresets">
           <button type="button" class="ghost small" onclick="setCron('0 7 * * 1','Weekly, Mon 07:00')">weekly</button>
           <button type="button" class="ghost small" onclick="setCron('0 7 * * *','Daily, 07:00')">daily</button>
           <button type="button" class="ghost small" onclick="setCron('0 7 1 * *','Monthly, 1st 07:00')">monthly</button>
         </div>
-        <label>Recipients (one email per line)</label>
-        <textarea id="emailTo" placeholder="you@example.com&#10;colleague@example.com"></textarea>
+        <label for="emailTo">Recipients (one email per line)</label>
+      <textarea id="emailTo" placeholder="you@example.com&#10;colleague@example.com"></textarea>
       </div>
 
       <!-- CONCEPTS -->
@@ -157,7 +158,7 @@
       <div class="actions">
         <button onclick="save()">Save search</button>
         <button class="ghost" onclick="resetForm()">Clear</button>
-        <span id="msg" class="muted"></span>
+        <span id="msg" class="muted" role="status" aria-live="polite"></span>
       </div>
 
       <details id="feedlinks" style="margin-top:16px; display:none">
@@ -172,13 +173,25 @@
 const BASE = {{ base_url|tojson }};
 const STUDY_TYPES = {{ study_types|tojson }};
 const $ = s => document.querySelector(s);
+let signalSettingsLoaded=true;
 
+function node(tag, text, className) {
+  const el=document.createElement(tag);
+  if(text!==undefined) el.textContent=text;
+  if(className) el.className=className;
+  return el;
+}
 function conceptRow(c={name:"",terms:[],mesh:[]}) {
-  const d=document.createElement("div"); d.className="concept";
-  d.innerHTML=`<input class="cname" placeholder="concept name (e.g. intervention)" value="${c.name||""}">
-    <textarea class="cterms" placeholder="terms, one per line">${(c.terms||[]).join("\n")}</textarea>
-    <textarea class="cmesh" placeholder="MeSH headings, one per line">${(c.mesh||[]).join("\n")}</textarea>
-    <button class="ghost small" type="button" onclick="this.parentElement.remove()">remove</button>`;
+  const d=node("div",undefined,"concept");
+  const fields=[["input","cname","Concept name",c.name||""],
+    ["textarea","cterms","Terms, one per line",(c.terms||[]).join("\n")],
+    ["textarea","cmesh","MeSH headings, one per line",(c.mesh||[]).join("\n")]];
+  fields.forEach(([tag,cls,label,value])=>{
+    const input=node(tag,undefined,cls); input.placeholder=label;
+    input.setAttribute("aria-label",label); input.value=value; d.appendChild(input);
+  });
+  const remove=node("button","remove","ghost small"); remove.type="button";
+  remove.addEventListener("click",()=>d.remove()); d.appendChild(remove);
   return d;
 }
 function addConcept(c){ $("#concepts").appendChild(conceptRow(c)); }
@@ -191,6 +204,7 @@ $("#emailEnabled").addEventListener("change", e=>{
 });
 
 function resetForm(){
+  signalSettingsLoaded=true;
   $("#editorTitle").innerText="New search";
   ["#qid","#qlabel","#qfilter"].forEach(s=>$(s).value="");
   $("#qdays").value=7; $("#qenabled").value="true"; $("#qid").disabled=false;
@@ -207,41 +221,52 @@ function resetForm(){
   $("#sigMinConf").value="unverified"; $("#sigInstant").checked=false;
   $("#sigTargets").value="";
   $("#emailCron").value="0 7 * * 1"; $("#cronHuman").innerText=""; $("#emailTo").value="";
-  $("#concepts").innerHTML=""; addConcept();
+  $("#concepts").replaceChildren(); addConcept();
   $("#feedlinks").style.display="none"; $("#msg").innerText="";
 }
 
 async function loadList(){
-  const r=await fetch("/api/questions");
-  if(!r.ok){ $("#qlist").innerText="session expired — reload"; return; }
-  const qs=await r.json();
-  $("#qlist").innerHTML = qs.map(q=>`
-    <div class="qrow">
-      <span><strong>${q.label}</strong> <code>${q.id}</code>
-        ${q.enabled?"":"<span class='tag off'>off</span>"}
-        ${q.email_enabled?"<span class='tag on'>✉</span>":""}</span>
-      <span>
-        <button class="ghost small" onclick='edit(${JSON.stringify(JSON.stringify(q))})'>edit</button>
-        <button class="ghost small danger" onclick="del('${q.id}')">delete</button>
-      </span>
-    </div>`).join("") || "<em>No searches yet.</em>";
+  try {
+    const r=await fetch("/api/questions");
+    if(!r.ok){ $("#qlist").textContent="Session expired — reload"; return; }
+    const qs=await r.json();
+    const list=$("#qlist"); list.replaceChildren();
+    if(!qs.length) list.appendChild(node("em","No searches yet."));
+    qs.forEach(q=>{
+      const row=node("div",undefined,"qrow"), title=node("span"), actions=node("span");
+      title.append(node("strong",q.label),document.createTextNode(" "),node("code",q.id));
+      if(!q.enabled) title.appendChild(node("span","off","tag off"));
+      if(q.email_enabled) title.appendChild(node("span","email on","tag on"));
+      const editButton=node("button","edit","ghost small"); editButton.type="button";
+      editButton.addEventListener("click",()=>edit(q));
+      const deleteButton=node("button","delete","ghost small danger"); deleteButton.type="button";
+      deleteButton.addEventListener("click",()=>del(q.id));
+      actions.append(editButton,deleteButton); row.append(title,actions); list.appendChild(row);
+    });
+  } catch(e) { $("#qlist").textContent="Could not load searches. Retry or reload."; }
 }
 
 function showFeeds(id){
-  const base = BASE || (location.origin);
-  let html = `<div class="feedrow"><code>${base}/feed/${id}.xml</code> <span class="muted">(curated)</span></div>`;
-  html += `<div class="feedrow"><code>${base}/feed/${id}/all.xml</code> <span class="muted">(everything)</span></div>`;
-  html += `<details><summary class="muted">filtered feeds</summary><ul class="subfeeds">`;
-  STUDY_TYPES.forEach(t=> html+=`<li><code>${base}/feed/${id}/${t}.xml</code></li>`);
-  html += `</ul><div class="feedrow" style="margin-top:6px"><code>${base}/signals/${id}.xml</code> <span class="muted">(signals, curated)</span></div>`;
-  html += `<div class="feedrow"><code>${base}/signals/${id}/all.xml</code> <span class="muted">(signals, everything incl. unverified)</span></div>`;
-  html += `<div class="muted small">per-type: ${base}/signals/${id}/&lt;type&gt;.xml</div><ul style="display:none">`;
-  html += `<li><code>${base}/feed/${id}/preprints.xml</code></li></ul></details>`;
-  $("#feedurls").innerHTML=html; $("#feedlinks").style.display="block";
+  const base=(BASE || location.origin).replace(/\/+$/, ""), slug=encodeURIComponent(id);
+  const holder=$("#feedurls"); holder.replaceChildren();
+  const add=(path,label)=>{
+    const row=node("div",undefined,"feedrow");
+    row.append(node("code",base+path),document.createTextNode(" "),node("span",label,"muted"));
+    holder.appendChild(row);
+  };
+  add(`/feed/${slug}.xml`,"Curated literature");
+  add(`/feed/${slug}/all.xml`,"All stored literature (latest feed window)");
+  STUDY_TYPES.forEach(type=>add(`/feed/${slug}/${encodeURIComponent(type)}.xml`,type));
+  add(`/feed/${slug}/preprints.xml`,"Preprints");
+  add(`/signals/${slug}.xml`,"Signals at the configured confidence floor");
+  add(`/signals/${slug}/all.xml`,"All confidence tiers (latest feed window)");
+  $("#feedlinks").style.display="block";
 }
 
-function edit(qstr){
-  const q=JSON.parse(JSON.parse(qstr));
+function edit(q){
+  // The event handler closes over the object; no nested serialization or HTML.
+  resetForm();
+  signalSettingsLoaded=false;
   $("#editorTitle").innerText="Edit: "+q.label;
   $("#qid").value=q.id; $("#qid").disabled=true; $("#qlabel").value=q.label;
   $("#qdays").value=q.from_days_back; $("#qenabled").value=q.enabled?"true":"false";
@@ -261,11 +286,13 @@ function edit(qstr){
   $("#digestMode").value=q.digest_mode||"all"; $("#minScore").value=(q.min_score!=null?q.min_score:0);
   $("#emailCron").value=q.email_cron||"0 7 * * 1";
   $("#emailTo").value=(q.email_to||[]).join("\n");
-  $("#concepts").innerHTML=""; (q.concepts||[]).forEach(addConcept);
+  $("#concepts").replaceChildren(); (q.concepts||[]).forEach(addConcept);
   if(!q.concepts||!q.concepts.length) addConcept();
   showFeeds(q.id);
-  fetch(`/api/signal_config/${q.id}`).then(r=>r.ok?r.json():null).then(sc=>{
-    if(!sc) return;
+  fetch(`/api/signal_config/${encodeURIComponent(q.id)}`).then(r=>r.ok?r.json():null).then(sc=>{
+    if($("#qid").value!==q.id) return;
+    if(!sc) throw new Error("Signal settings unavailable");
+    signalSettingsLoaded=true;
     document.querySelectorAll(".sigsrc").forEach(cb=>cb.checked=!!sc.sources[cb.value]);
     document.querySelectorAll(".sigcat").forEach(cb=>cb.checked=!!sc.feed_categories[cb.value]);
     $("#sigMinConf").value=sc.min_confidence||"unverified";
@@ -274,17 +301,30 @@ function edit(qstr){
     Object.entries(sc.api_key_present||{}).forEach(([k,v])=>{
       const e=$("#sks-"+k); if(e) e.innerText=v?"(key stored)":"";
     });
-  });
+  }).catch(()=>{ $("#msg").textContent="Search loaded; signal settings could not be loaded. Reload before saving."; });
   window.scrollTo(0,0);
 }
 
 async function del(id){
   if(!confirm("Delete "+id+"? This removes its records too.")) return;
-  await fetch("/api/questions/"+id,{method:"DELETE"}); loadList();
+  try {
+    const r=await fetch("/api/questions/"+encodeURIComponent(id),{method:"DELETE"});
+    if(!r.ok) throw new Error(await r.text());
+    if($("#qid").value===id) resetForm();
+    await loadList();
+  } catch(e) { $("#msg").textContent="Delete failed: "+e.message; }
 }
 const lines=t=>t.split("\n").map(s=>s.trim()).filter(Boolean);
 
 async function save(){
+  if(!signalSettingsLoaded){ $("#msg").textContent="Wait for signal settings, or reload this search before saving."; return; }
+  let targets=[];
+  try {
+    const text=$("#sigTargets").value.trim();
+    targets=text?JSON.parse(text):[];
+    if(!Array.isArray(targets)) throw new Error("Expected a JSON array");
+  } catch(e) { $("#msg").textContent="Scrape targets: "+e.message; return; }
+  try {
   const concepts=[...document.querySelectorAll(".concept")].map(d=>({
     name:d.querySelector(".cname").value.trim(),
     terms:lines(d.querySelector(".cterms").value),
@@ -310,38 +350,42 @@ async function save(){
   if(!payload.id||!payload.label||!concepts.length){ $("#msg").innerText="id, label, and ≥1 concept required"; return; }
   if(payload.email_enabled && !payload.email_to.length){ $("#msg").innerText="email on, but no recipients"; return; }
   const r=await fetch("/api/questions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-  $("#msg").innerText = r.ok ? "saved ✓" : "error saving";
+  if(!r.ok) throw new Error(await r.text());
   if(r.ok){
     const sigsrc={}; document.querySelectorAll(".sigsrc").forEach(cb=>sigsrc[cb.value]=cb.checked);
     const sigcat={}; document.querySelectorAll(".sigcat").forEach(cb=>{ if(cb.checked) sigcat[cb.value]=true; });
     const sigkeys={}; document.querySelectorAll(".sigkey").forEach(i=>{ if(i.value) sigkeys[i.dataset.src]=i.value; });
-    let targets=[];
-    const tv=$("#sigTargets").value.trim();
-    if(tv){ try{ targets=JSON.parse(tv); }catch(e){ alert("Scrape targets: invalid JSON — signals config not saved"); targets=null; } }
-    if(targets!==null){
-      const sr=await fetch(`/api/signal_config/${payload.id}`,{method:"POST",
+    {
+      const sr=await fetch(`/api/signal_config/${encodeURIComponent(payload.id)}`,{method:"POST",
         headers:{"Content-Type":"application/json"},
         body:JSON.stringify({sources:sigsrc,min_confidence:$("#sigMinConf").value,
           instant_alerts:$("#sigInstant").checked,feed_categories:sigcat,
           scrape_targets:targets,api_keys:sigkeys})});
-      if(!sr.ok) alert("Signals config save failed: "+(await sr.text()));
+      if(!sr.ok) throw new Error("Search saved, but signal settings failed: "+(await sr.text()));
     }
-    loadList(); showFeeds(payload.id);
+    $("#msg").textContent="Saved";
+    await loadList(); showFeeds(payload.id);
   }
+  } catch(e) { $("#msg").textContent="Save failed: "+e.message; }
 }
 
 resetForm(); async function loadHealth(){
-  const r=await fetch("/api/source_health");
-  if(!r.ok){ $("#healthbox").innerText="unavailable"; return; }
-  const d=await r.json();
-  if(!d.sources.length){ $("#healthbox").innerText="no runs logged yet — health appears after the first pipeline run"; return; }
-  let h="<table style='width:100%;font-size:12px;border-collapse:collapse'>"+
-    "<tr style='text-align:left;color:#888'><th>source</th><th>track</th><th>last ok</th><th>last non-empty</th><th></th></tr>";
-  d.sources.forEach(s=>{
-    const flag=s.stale?"<span style='background:#f8d7da;padding:1px 6px;border-radius:3px'>STALE</span>":"<span style='color:#2a7'>ok</span>";
-    h+=`<tr><td>${s.source}</td><td>${s.track}</td><td>${s.last_ok||"—"}</td><td>${s.last_nonempty||"—"}</td><td>${flag}</td></tr>`;
-  });
-  $("#healthbox").innerHTML=h+"</table>";
+  try {
+    const r=await fetch("/api/source_health");
+    if(!r.ok){ $("#healthbox").textContent="Unavailable"; return; }
+    const d=await r.json(), box=$("#healthbox"); box.replaceChildren();
+    if(!d.sources.length){ box.textContent="No runs logged yet — health appears after the first pipeline run"; return; }
+    const table=node("table"), head=node("tr");
+    ["source","track","last ok","last non-empty","status"].forEach(label=>head.appendChild(node("th",label)));
+    table.appendChild(head);
+    d.sources.forEach(source=>{
+      const row=node("tr");
+      [source.source,source.track,source.last_ok||"—",source.last_nonempty||"—",source.stale?"STALE":"ok"]
+        .forEach(value=>row.appendChild(node("td",value)));
+      table.appendChild(row);
+    });
+    box.appendChild(table);
+  } catch(e) { $("#healthbox").textContent="Could not load source health."; }
 }
 loadHealth();
 loadList();

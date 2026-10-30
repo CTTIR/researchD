@@ -17,7 +17,8 @@ DB_MIGRATIONS <- list(
   list("questions",     "min_score",       "REAL DEFAULT 0"),
   list("signal_config", "feed_categories", "TEXT DEFAULT '{}'"),
   list("signal_config", "instant_alerts",  "INTEGER DEFAULT 0"),
-  list("records",       "oa_url",          "TEXT")
+  list("records",       "oa_url",          "TEXT"),
+  list("records",       "provenance",      "TEXT DEFAULT '[]'")
 )
 
 db_migrate <- function(con) {
@@ -47,34 +48,59 @@ db_init_schema <- function(con, schema_path = "db/schema.sql") {
 }
 
 # Decrypt one Fernet token by shelling out to the python helper.
-# Returns "" on any failure (missing key, wrong master key, etc.).
+# An absent token means no configured credential. A configured but unreadable
+# token must fail visibly rather than silently issuing unauthenticated requests.
 .decrypt_key <- function(token) {
-  if (is.null(token) || !nzchar(token)) return("")
+  if (is.null(token) || !length(token) || identical(token, "")) return("")
+  if (!is.character(token) || length(token) != 1L || is.na(token))
+    stop("Configured API key has an invalid encrypted value", call. = FALSE)
   helper <- "web/decrypt_key.py"
-  if (!file.exists(helper)) return("")
+  if (!file.exists(helper))
+    stop("Cannot decrypt configured API key: web/decrypt_key.py is missing", call. = FALSE)
   out <- tryCatch(
-    system2("python3", helper, input = token, stdout = TRUE, stderr = FALSE),
-    error = function(e) "")
-  if (length(out) == 0) "" else paste(out, collapse = "")
+    suppressWarnings(system2("python3", helper, input = token, stdout = TRUE, stderr = FALSE)),
+    error = function(e) structure(character(0), status = 127L))
+  status <- attr(out, "status") %||% 0L
+  if (status != 0L || !length(out) || !nzchar(paste(out, collapse = ""))) {
+    reason <- switch(as.character(status),
+      `2` = "APP_SECRET_KEY is missing; restore the matching master key",
+      `3` = "install the Python cryptography dependency before running the engine",
+      `4` = "restore the matching APP_SECRET_KEY or replace the stored credential",
+      `127` = "the Python decryption helper could not be executed",
+      "the decryption helper failed or returned an empty credential")
+    stop("Cannot decrypt configured API key: ", reason, call. = FALSE)
+  }
+  paste(out, collapse = "\n")
+}
+
+# JSON parsers may echo the failing input. Report the field, never stored key
+# material or private concept text, when a persisted configuration is corrupt.
+.read_config_json <- function(value, field, default) {
+  tryCatch(jsonlite::fromJSON(value %||% default), error = function(e)
+    stop("Invalid JSON in ", field, call. = FALSE))
 }
 
 # Read all enabled questions from the DB into the list shape the
 # pipeline expects, including per-question sources + decrypted keys.
-load_questions_db <- function(con) {
+load_questions_db <- function(con, selected_ids = character(0)) {
   qs <- DBI::dbGetQuery(con, "SELECT * FROM questions WHERE enabled = 1")
-  if (nrow(qs) == 0) return(list())
+  if (length(selected_ids)) qs <- qs[qs$id %in% selected_ids, , drop = FALSE]
+  failures <- list()
   # One unloadable question must not sink the run (ACCEPTANCE C3). The JSON
   # columns are written by the web UI and are normally well-formed, but a
   # hand-edited row, a partially-applied migration or a future schema change
   # would otherwise abort the whole cycle here -- before ANY question runs.
   out <- lapply(seq_len(nrow(qs)), function(i) {
     tryCatch(.load_one_question(con, qs[i, ]), error = function(e) {
+      failures[[qs$id[i]]] <<- conditionMessage(e)
       message("  [WARN] skipping unloadable question '", qs$id[i], "': ",
               conditionMessage(e))
       NULL
     })
   })
-  Filter(Negate(is.null), out)
+  out <- Filter(Negate(is.null), out)
+  attr(out, "load_errors") <- failures
+  out
 }
 
 .load_one_question <- function(con, q) {
@@ -85,29 +111,27 @@ load_questions_db <- function(con) {
     concepts <- lapply(seq_len(nrow(cons)), function(j) {
       list(
         name  = cons$name[j],
-        terms = jsonlite::fromJSON(cons$terms[j] %||% "[]"),
-        mesh  = jsonlite::fromJSON(cons$mesh[j] %||% "[]")
+        terms = .read_config_json(cons$terms[j], "concepts.terms", "[]"),
+        mesh  = .read_config_json(cons$mesh[j], "concepts.mesh", "[]")
       )
     })
     # per-question source toggles (default: all on if unspecified)
-    src_obj <- tryCatch(jsonlite::fromJSON(q$sources %||% "{}"),
-                        error = function(e) list())
+    src_obj <- .read_config_json(q$sources, "questions.sources", "{}")
     # decrypt per-source API keys
-    key_obj_enc <- tryCatch(jsonlite::fromJSON(q$api_keys_enc %||% "{}"),
-                            error = function(e) list())
+    key_obj_enc <- .read_config_json(q$api_keys_enc, "questions.api_keys_enc", "{}")
     api_keys <- lapply(key_obj_enc, .decrypt_key)
 
     list(
       id = q$id, label = q$label,
       concepts = concepts,
-      study_filter = jsonlite::fromJSON(q$study_filter %||% "[]"),
+      study_filter = .read_config_json(q$study_filter, "questions.study_filter", "[]"),
       from_days_back = q$from_days_back %||% 7,
-      delivery = jsonlite::fromJSON(q$delivery %||% '["file"]'),
+      delivery = .read_config_json(q$delivery, "questions.delivery", '["file"]'),
       sources = src_obj,
       api_keys = api_keys,
       email_enabled = as.logical(q$email_enabled %||% 0),
       email_cron = q$email_cron %||% "0 7 * * 1",
-      email_to = jsonlite::fromJSON(q$email_to %||% "[]"),
+      email_to = .read_config_json(q$email_to, "questions.email_to", "[]"),
       email_last_sent = q$email_last_sent
     )
   })
@@ -143,26 +167,67 @@ seed_questions_from_yaml <- function(con, yaml_path = "config/questions.yaml") {
 # ones. Replaces the old `filter_new` write to `seen`.
 persist_records <- function(con, recs, question_id, source_priority) {
   if (nrow(recs) == 0) return(recs)
-  recs <- .collapse_batch(recs, source_priority)   # from 03_dedup.R
+  recs <- .collapse_batch(recs, source_priority)
+  # Serialize read-then-insert against ingest and the other scheduled lane.
+  DBI::dbExecute(con, "BEGIN IMMEDIATE")
+  committed <- FALSE
+  on.exit(if (!committed) DBI::dbRollback(con), add = TRUE)
   existing <- DBI::dbGetQuery(con,
-    "SELECT dedup_key FROM records WHERE question_id = ?",
-    params = list(question_id))$dedup_key
-  new <- recs[!(recs$dedup_key %in% existing), , drop = FALSE]
-  if (nrow(new) == 0) return(new)
-
-  ins <- data.frame(
-    dedup_key = new$dedup_key, question_id = question_id,
-    source = new$source, ext_id = new$ext_id %||% "", doi = new$doi,
-    title = new$title, abstract = new$abstract %||% "",
-    authors = new$authors, journal = new$journal,
-    pub_date = as.character(new$pub_date), url = new$url,
-    oa_url = new$oa_url %||% "",
-    type = new$type, study_type = new$study_type %||% "unclassified",
-    is_preprint = new$is_preprint %||% 0L,
-    score = new$score %||% 0,
-    stringsAsFactors = FALSE
-  )
-  DBI::dbWriteTable(con, "records", ins, append = TRUE)
+    "SELECT * FROM records WHERE question_id = ?", params = list(question_id))
+  for (i in which(recs$dedup_key %in% existing$dedup_key)) {
+    prior <- existing[match(recs$dedup_key[i], existing$dedup_key), , drop = FALSE]
+    fields <- intersect(c("abstract", "authors", "journal", "url", "oa_url"), names(recs))
+    filled <- character(0)
+    for (field in fields) {
+      if ((is.na(prior[[field]][1]) || !nzchar(prior[[field]][1])) &&
+          !is.na(recs[[field]][i]) && nzchar(recs[[field]][i])) {
+        prior[[field]][1] <- recs[[field]][i]
+        filled <- c(filled, field)
+      }
+    }
+    if (length(filled)) DBI::dbExecute(con,
+      "UPDATE records SET abstract=?,authors=?,journal=?,url=?,oa_url=?
+       WHERE question_id=? AND dedup_key=?",
+      params = list(prior$abstract[1], prior$authors[1], prior$journal[1],
+                    prior$url[1], prior$oa_url[1], question_id, recs$dedup_key[i]))
+    old_prov <- tryCatch(jsonlite::fromJSON(prior$provenance[1] %||% "[]", simplifyVector = FALSE),
+      error = function(e) list())
+    new_prov <- jsonlite::fromJSON(recs$provenance[i], simplifyVector = FALSE)
+    # A source can supply a field to an older persisted record even when it
+    # was the primary row of this batch. Record that actual contribution.
+    for (field in filled) {
+      contributor <- which(vapply(new_prov, function(p) field %in% unlist(p$fields), logical(1)))
+      index <- if (length(contributor)) contributor[1L] else 1L
+      new_prov[[index]]$fields <- as.list(unique(c(unlist(new_prov[[index]]$fields), field)))
+    }
+    all_prov <- c(old_prov, new_prov)
+    DBI::dbExecute(con, "UPDATE records SET provenance=? WHERE question_id=? AND dedup_key=?",
+      params = list(.provenance_json(all_prov),
+                    question_id, recs$dedup_key[i]))
+  }
+  new <- recs[!(recs$dedup_key %in% existing$dedup_key), , drop = FALSE]
+  if (nrow(new)) {
+    ins <- data.frame(
+      dedup_key = new$dedup_key, question_id = question_id,
+      source = new$source, ext_id = new$ext_id %||% "", doi = new$doi,
+      title = new$title, abstract = new$abstract %||% "",
+      authors = new$authors, journal = new$journal,
+      pub_date = as.character(new$pub_date), url = new$url,
+      oa_url = new$oa_url %||% "", provenance = new$provenance,
+      type = new$type, study_type = new$study_type %||% "unclassified",
+      is_preprint = new$is_preprint %||% 0L, score = new$score %||% 0,
+      stringsAsFactors = FALSE)
+    DBI::dbWriteTable(con, "records", ins, append = TRUE)
+    channels <- DBI::dbGetQuery(con, "SELECT delivery FROM questions WHERE id=?", params = list(question_id))
+    delivery <- if (nrow(channels)) jsonlite::fromJSON(channels$delivery[1] %||% "[]") else character(0)
+    for (channel in intersect(delivery, c("zotero", "file"))) {
+      for (key in new$dedup_key)
+        DBI::dbExecute(con,
+          "INSERT OR IGNORE INTO delivery_outbox(channel,question_id,dedup_key) VALUES(?,?,?)",
+          params = list(channel, question_id, key))
+    }
+  }
+  DBI::dbCommit(con); committed <- TRUE
   new
 }
 
@@ -196,8 +261,7 @@ heartbeat <- function(con, service, ok = TRUE, detail = "", error = "") {
 
 # Write one fetch_log row per source (health heartbeat; see /api/source_health)
 # Accepts either the structured form fetch_question() now produces --
-# list(n =, ok =, error =) per source -- or a bare row count, which older
-# callers (and the signals track) still pass.
+# list(n =, ok =, error =) per source -- or a bare row count for compatibility.
 log_fetch <- function(con, question_id, track, source_counts) {
   if (is.null(source_counts) || length(source_counts) == 0) return(invisible(NULL))
   for (src in names(source_counts)) {
@@ -205,6 +269,7 @@ log_fetch <- function(con, question_id, track, source_counts) {
     if (is.list(entry)) {
       n  <- entry$n %||% 0
       ok <- isTRUE(entry$ok)
+      if (!ok) message("  [WARN] ", track, "/", src, ": ", entry$error %||% "fetch failed")
     } else {
       n  <- entry %||% 0
       ok <- TRUE
@@ -235,7 +300,7 @@ reclassify_unclassified <- function(con, question_id, q = NULL, settings = NULL)
       WHERE question_id = ? AND (study_type = 'unclassified' OR study_type IS NULL)",
     params = list(question_id))
   if (nrow(rows) == 0) return(invisible(0))
-  rows$pub_date <- suppressWarnings(as.Date(rows$pub_date))
+  rows$pub_date <- .parse_date(rows$pub_date)
   # classify_study_type expects a data.frame with these columns
   rows$study_type <- NA_character_
   classified <- classify_study_type(rows)   # from 06_classify.R
@@ -254,7 +319,9 @@ reclassify_unclassified <- function(con, question_id, q = NULL, settings = NULL)
   for (i in seq_len(nrow(classified))) {
     st <- classified$study_type[i]
     pp <- classified$is_preprint[i]
-    if (!is.na(st) && st != "unclassified") {
+    # An unknown study design can still have a confirmed preprint flag and a
+    # useful relevance score. Do not leave those values at ingestion defaults.
+    if (!is.na(st)) {
       sc <- classified$score[i]
       if (!is.null(sc) && !is.na(sc)) {
         DBI::dbExecute(con,

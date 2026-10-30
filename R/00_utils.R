@@ -9,8 +9,9 @@
 }
 
 # Robust date parser: handles YYYY-MM-DD, YYYY/MM/DD, "YYYY Mon DD",
-# "YYYY Mon", ISO timestamps, and bare years. Never errors, never guesses
-# a month or day that was not in the input.
+# "YYYY Mon", ISO timestamps, compact FDA YYYYMMDD, and bare years.
+# Partial dates use the first day of the specified month/year; unknown dates
+# stay NA rather than being interpreted as today's date.
 #
 # Two traps this deliberately avoids:
 #   * paste0(character(0), "-01-01") is "-01-01", NOT character(0) -- the
@@ -26,6 +27,9 @@
   x <- as.character(x)
   if (length(x) == 0) return(.as_na_date(0L))
   out <- .as_na_date(length(x))
+  compact <- !is.na(x) & grepl("^[0-9]{8}$", x)
+  if (any(compact))
+    out[compact] <- suppressWarnings(as.Date(x[compact], format = "%Y%m%d"))
   for (f in c("%Y-%m-%d", "%Y/%m/%d", "%Y %b %d", "%Y %B %d")) {
     miss <- is.na(out)
     if (!any(miss)) break
@@ -57,15 +61,23 @@
 # bare-R install silently under-installed and the signals track failed at
 # run time.
 REQUIRED_PKGS <- c(
-  "yaml", "rentrez", "europepmc", "openalexR", "httr2", "jsonlite",
-  "DBI", "RSQLite", "blastula", "htmltools",
+  "yaml", "rentrez", "europepmc", "httr2", "jsonlite",
+  "DBI", "RSQLite", "blastula", "htmltools", "filelock",
   "ctrdata", "nodbi", "rvest", "xml2"
 )
 
-ensure_packages <- function(pkgs = REQUIRED_PKGS) {
+# Startup requires only the core engine. Optional source packages are checked
+# when that source is enabled and failures appear in source health. Installation
+# is an explicit preparation step, never a network mutation during a cron run.
+CORE_PKGS <- c("yaml", "httr2", "jsonlite", "DBI", "RSQLite", "filelock", "htmltools")
+
+ensure_packages <- function(pkgs = CORE_PKGS) {
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing)) {
-    message("Installing missing packages: ", paste(missing, collapse = ", "))
-    install.packages(missing, repos = "https://cloud.r-project.org")
+    stop("Missing required R packages: ", paste(missing, collapse = ", "),
+      ". Install them before starting researchd: install.packages(c(",
+      paste(sprintf('"%s"', missing), collapse = ", "),
+      '), repos = "https://cloud.r-project.org")', call. = FALSE)
   }
+  invisible(TRUE)
 }

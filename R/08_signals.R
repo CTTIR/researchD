@@ -29,7 +29,8 @@
 # these APIs don't support nested boolean well). We OR every term across
 # all concepts; relevance scoring later handles precision.
 .signal_terms <- function(q) {
-  unique(unlist(lapply(q$concepts, function(c) c(c$terms, c$mesh))))
+  terms <- unique(unlist(lapply(q$concepts, function(c) c(c$terms, c$mesh))))
+  terms[!is.na(terms) & nzchar(trimws(terms))]
 }
 .quote_phrase <- function(x) ifelse(grepl("\\s", x), paste0('"', x, '"'), x)
 
@@ -55,13 +56,16 @@ fetch_sec_edgar <- function(q, days_back, settings) {
     httr2::req_url_query(q = qstr, forms = "8-K", dateRange = "custom",
                          startdt = from, enddt = to) |>
     httr2::req_headers(`User-Agent` = ua, Accept = "application/json") |>
+    httr2::req_timeout(30) |>
     httr2::req_retry(max_tries = 3) |>
     httr2::req_perform()
   js <- httr2::resp_body_json(resp)
   hits <- js$hits$hits
   if (is.null(hits) || length(hits) == 0) return(.empty_signals())
+  page_count <- length(hits)
+  hits <- utils::head(hits, .fetch_limit(settings))
 
-  do.call(rbind, lapply(hits, function(h) {
+  out <- do.call(rbind, lapply(hits, function(h) {
     src <- h$`_source`
     cik <- if (length(src$cik)) src$cik[[1]] else ""
     adsh <- src$`_id` %||% h$`_id` %||% ""
@@ -82,6 +86,11 @@ fetch_sec_edgar <- function(q, days_back, settings) {
       score = 0, stringsAsFactors = FALSE
     )
   }))
+  total <- js$hits$total
+  if (is.list(total)) total <- total$value
+  if ((length(total) && total > nrow(out)) || (!length(total) && page_count >= 100L))
+    out <- .fetch_issue(out, "SEC first-page result limit reached; retrieval incomplete")
+  out
 }
 
 # --- NIH RePORTER (grant awards — earliest possible signal) ----
@@ -93,26 +102,27 @@ fetch_nih_reporter <- function(q, days_back, settings) {
   body <- list(
     criteria = list(
       advanced_text_search = list(
-        operator = "and",
+        operator = "or",
         search_field = "projecttitle,terms,abstracttext",
         search_text = paste(terms, collapse = " ")
       ),
       award_notice_date = list(from_date = from,
                                to_date = format(Sys.Date(), "%Y-%m-%d"))
     ),
-    include_fields = list("ProjectTitle","AbstractText","Organization",
+    include_fields = list("ApplId","ProjectTitle","AbstractText","Organization",
                           "AwardNoticeDate","ProjectNum","ContactPiName",
                           "AgencyIcAdmin","AwardAmount"),
-    limit = 100, offset = 0
+    limit = min(100L, .fetch_limit(settings)), offset = 0
   )
   resp <- httr2::request("https://api.reporter.nih.gov/v2/projects/search") |>
     httr2::req_body_json(body) |>
+    httr2::req_timeout(30) |>
     httr2::req_retry(max_tries = 3) |>
     httr2::req_perform()
   js <- httr2::resp_body_json(resp)
   results <- js$results
   if (is.null(results) || length(results) == 0) return(.empty_signals())
-  do.call(rbind, lapply(results, function(r) {
+  out <- do.call(rbind, lapply(results, function(r) {
     org <- r$organization$org_name %||% ""
     data.frame(
       signal_type = "grant", source = "nih_reporter",
@@ -120,7 +130,8 @@ fetch_nih_reporter <- function(q, days_back, settings) {
       title = r$project_title %||% "",
       summary = substr(r$abstract_text %||% "", 1, 2000),
       org = org, signal_date = r$award_notice_date %||% "",
-      url = paste0("https://reporter.nih.gov/project-details/", r$project_num %||% ""),
+      url = r$project_detail_url %||% if (!is.null(r$appl_id))
+        paste0("https://reporter.nih.gov/project-details/", r$appl_id) else "https://reporter.nih.gov/",
       confidence = "authoritative",
       extra = jsonlite::toJSON(list(
         pi = r$contact_pi_name %||% "",
@@ -129,6 +140,10 @@ fetch_nih_reporter <- function(q, days_back, settings) {
       score = 0, stringsAsFactors = FALSE
     )
   }))
+  total <- js$meta$total
+  if ((length(total) && total > nrow(out)) || (!length(total) && nrow(out) >= body$limit))
+    out <- .fetch_issue(out, "NIH RePORTER first-page result limit reached; retrieval incomplete")
+  out
 }
 
 # --- openFDA (approvals, designations, safety) -----------------
@@ -138,27 +153,49 @@ fetch_openfda <- function(q, days_back, settings) {
   if (length(terms) == 0) return(.empty_signals())
   # Search drug labels updated recently mentioning the terms.
   search_expr <- paste0("(",
-    paste(sprintf('indications_and_usage:"%s"', terms[seq_len(min(5, length(terms)))]),
-          collapse = "+OR+"), ")")
+    paste(sprintf('indications_and_usage:"%s"', terms),
+          collapse = " OR "), ")")
+  from <- format(Sys.Date() - days_back, "%Y%m%d")
+  to <- format(Sys.Date(), "%Y%m%d")
+  search_expr <- paste0(search_expr, " AND effective_time:[", from, " TO ", to, "]")
   key <- settings$signal_keys$openfda %||% ""
   url <- "https://api.fda.gov/drug/label.json"
   req <- httr2::request(url) |>
-    httr2::req_url_query(search = search_expr, limit = 50)
+    httr2::req_url_query(search = search_expr, limit = min(100L, .fetch_limit(settings))) |>
+    httr2::req_timeout(30) |>
+    httr2::req_error(is_error = function(resp) httr2::resp_status(resp) >= 400L && httr2::resp_status(resp) != 404L)
   if (nzchar(key)) req <- httr2::req_url_query(req, api_key = key)
-  resp <- httr2::req_perform(httr2::req_retry(req, max_tries = 2))
-  js <- httr2::resp_body_json(resp)
-  results <- js$results
-  if (is.null(results) || length(results) == 0) return(.empty_signals())
-  do.call(rbind, lapply(results, function(r) {
+  results <- list(); issue <- NULL; limit <- min(.fetch_limit(settings), 25000L)
+  repeat {
+    page_req <- httr2::req_url_query(req, skip = length(results), limit = min(100L, limit - length(results)))
+    resp <- tryCatch(httr2::req_perform(httr2::req_retry(page_req, max_tries = 2)), error = identity)
+    if (inherits(resp, "error")) {
+      if (!length(results)) stop(resp)
+      issue <- "openFDA page request failed; retrieval incomplete"
+      break
+    }
+    if (httr2::resp_status(resp) == 404L) break
+    js <- httr2::resp_body_json(resp)
+    page <- js$results %||% list()
+    results <- c(results, page)
+    total <- js$meta$results$total %||% length(results)
+    if (!length(page) || length(results) >= total) break
+    if (length(results) >= limit) {
+      issue <- "openFDA result limit reached; retrieval incomplete"
+      break
+    }
+  }
+  if (length(results) == 0) return(.empty_signals())
+  out <- do.call(rbind, lapply(results, function(r) {
     openfda <- r$openfda %||% list()
     brand <- paste(unlist(openfda$brand_name), collapse = "; ")
     data.frame(
       signal_type = "regulatory", source = "openfda",
-      ext_id = (openfda$application_number %||% list(""))[[1]],
+      ext_id = r$set_id %||% r$id %||% stop("FDA label has no document identifier"),
       title = paste0("FDA label: ", brand),
       summary = substr(paste(unlist(r$indications_and_usage), collapse = " "), 1, 1500),
       org = paste(unlist(openfda$manufacturer_name), collapse = "; "),
-      signal_date = r$effective_time %||% "",
+      signal_date = as.character(.parse_date(r$effective_time %||% "")),
       url = "https://labels.fda.gov/",
       confidence = "authoritative",
       extra = jsonlite::toJSON(list(brand = brand,
@@ -167,45 +204,84 @@ fetch_openfda <- function(q, days_back, settings) {
       score = 0, stringsAsFactors = FALSE
     )
   }))
+  if (!is.null(issue)) out <- .fetch_issue(out, issue)
+  out
 }
 
-# --- Clinical trials via ctrdata (CTGOV2 + CTIS + ISRCTN) ------
-# ctrdata gives ONE interface to US + EU + UK registries, including
-# results where available. Registrations precede papers by years;
-# CTIS has no public API so ctrdata's handling is the clean path.
+# --- Trial registrations and posted results -------------------
+# ClinicalTrials.gov supplies event dates and results-posting metadata through
+# its native API. CTIS/ISRCTN remain registry leads imported with ctrdata; an
+# import timestamp is never presented as a registration or results date.
+.ctgov_signals <- function(studies) {
+  if (!length(studies)) return(.empty_signals())
+  out <- lapply(studies, function(study) {
+    p <- study$protocolSection
+    id <- p$identificationModule$nctId %||% ""
+    if (!nzchar(id)) stop("ClinicalTrials.gov study has no NCT identifier")
+    status <- p$statusModule
+    title <- p$identificationModule$briefTitle %||% id
+    date <- as.character(.parse_date(status$studyFirstPostDateStruct$date))
+    extra <- as.character(jsonlite::toJSON(list(nct_id = id,
+      overall_status = status$overallStatus %||% "",
+      last_update = status$lastUpdatePostDateStruct$date %||% ""), auto_unbox = TRUE))
+    row <- data.frame(signal_type = "trial_registration", source = "ctgov2",
+      ext_id = id, title = title,
+      summary = p$descriptionModule$briefSummary %||% "",
+      org = p$sponsorCollaboratorsModule$leadSponsor$name %||% "",
+      signal_date = date, url = paste0("https://clinicaltrials.gov/study/", id),
+      confidence = "authoritative", extra = extra, score = 0, stringsAsFactors = FALSE)
+    result_date <- status$resultsFirstPostDateStruct$date %||% ""
+    if (isTRUE(study$hasResults) || length(study$resultsSection) || nzchar(result_date)) {
+      result <- row
+      result$signal_type <- "trial_result"
+      result$ext_id <- paste0(id, ":results")
+      result$title <- paste0("Results posted: ", title)
+      result$summary <- "Summary results are available in the trial registry; review the source for outcomes and limitations."
+      result$signal_date <- as.character(.parse_date(result_date))
+      row <- rbind(row, result)
+    }
+    row
+  })
+  result <- do.call(rbind, out)
+  if (!is.null(attr(studies, "fetch_error"))) result <- .fetch_issue(result, attr(studies, "fetch_error"))
+  result
+}
+
 fetch_trials_ctrdata <- function(q, days_back, settings) {
-  if (!requireNamespace("ctrdata", quietly = TRUE)) {
-    message("  [signals] ctrdata not installed; skipping trials registry track")
-    return(.empty_signals())
-  }
+  native <- .safe(.ctgov_signals(.fetch_ctgov_studies(build_clinicaltrials(q), days_back, settings)),
+                  "ClinicalTrials.gov signals", empty = .empty_signals)
+  if (!requireNamespace("ctrdata", quietly = TRUE))
+    return(.fetch_issue(native, "ctrdata is required for CTIS and ISRCTN registry leads"))
   terms <- .signal_terms(q)
-  if (length(terms) == 0) return(.empty_signals())
+  if (!length(terms)) return(native)
+  other <- .safe(.fetch_other_trial_registries(terms, days_back),
+                 "CTIS/ISRCTN registry leads", empty = .empty_signals)
+  .fetch_bind(list(native, other), empty = .empty_signals)
+}
+
+.fetch_other_trial_registries <- function(terms, days_back) {
   query <- paste(terms, collapse = " OR ")
-  # Use a temp DuckDB/SQLite-backed nodbi collection per ctrdata norms.
   tmp <- tempfile(fileext = ".sqlite")
   con <- nodbi::src_sqlite(dbname = tmp, collection = "trials")
   on.exit({ try(DBI::dbDisconnect(con$con), silent = TRUE); unlink(tmp) }, add = TRUE)
-
-  registers <- c("CTGOV2", "CTIS", "ISRCTN")
-  for (reg in registers) {
+  failures <- character(0)
+  for (reg in c("CTIS", "ISRCTN")) {
     url <- .safe_ctrdata_url(query, reg, days_back)
-    if (is.null(url)) next
-    try(ctrdata::ctrLoadQueryIntoDb(queryterm = url, con = con), silent = TRUE)
+    tryCatch(ctrdata::ctrLoadQueryIntoDb(queryterm = url, con = con),
+      error = function(e) { failures <<- c(failures, paste(reg, conditionMessage(e))) })
   }
-  recs <- try(ctrdata::dbGetFieldsIntoDf(
-    fields = c("_id", "ctrname", "record_last_import"),
-    con = con), silent = TRUE)
-  if (inherits(recs, "try-error") || is.null(recs) || nrow(recs) == 0)
-    return(.empty_signals())
-
-  data.frame(
-    signal_type = "trial_registration", source = tolower(recs$ctrname %||% "registry"),
-    ext_id = recs$`_id`, title = recs$`_id`,  # title enriched below if available
-    summary = "", org = "", signal_date = as.character(recs$record_last_import %||% Sys.Date()),
-    url = .trial_url(recs$`_id`, recs$ctrname),
-    confidence = "authoritative", extra = "{}",
-    score = 0, stringsAsFactors = FALSE
-  )
+  recs <- tryCatch(ctrdata::dbGetFieldsIntoDf(fields = c("_id", "ctrname"), con = con),
+    error = function(e) { failures <<- c(failures, "Unable to read CTIS/ISRCTN import"); NULL })
+  other <- .empty_signals()
+  if (!is.null(recs) && nrow(recs)) {
+    other <- data.frame(signal_type = "trial_registration",
+      source = tolower(recs$ctrname %||% "registry"), ext_id = recs$`_id`,
+      title = recs$`_id`, summary = "Registry lead; consult the linked record for dates and results.",
+      org = "", signal_date = NA_character_, url = .trial_url(recs$`_id`, recs$ctrname),
+      confidence = "authoritative", extra = "{}", score = 0, stringsAsFactors = FALSE)
+  }
+  if (length(failures)) other <- .fetch_issue(other, paste(failures, collapse = "; "))
+  other
 }
 
 # Build a register-native query URL for ctrdata (it wants the portal URL).
@@ -233,6 +309,8 @@ fetch_trials_ctrdata <- function(q, days_back, settings) {
 fetch_patentsview <- function(q, days_back, settings) {
   terms <- .signal_terms(q)
   if (length(terms) == 0) return(.empty_signals())
+  key <- settings$signal_keys$patentsview %||% ""
+  if (!nzchar(key)) stop("PatentsView requires a configured API key")
   from <- format(Sys.Date() - days_back, "%Y-%m-%d")
   # PatentsView query DSL (POST). _text_any over title+abstract.
   query <- list(`_and` = list(
@@ -244,14 +322,15 @@ fetch_patentsview <- function(q, days_back, settings) {
                         "patent_date","assignees.assignee_organization"),
                o = list(size = 100))
   resp <- httr2::request("https://search.patentsview.org/api/v1/patent/") |>
-    httr2::req_headers(`Content-Type` = "application/json") |>
+    httr2::req_headers(`Content-Type` = "application/json", `X-Api-Key` = key) |>
+    httr2::req_timeout(30) |>
     httr2::req_body_json(body) |>
     httr2::req_retry(max_tries = 2) |>
     httr2::req_perform()
   js <- httr2::resp_body_json(resp)
   pats <- js$patents %||% js$data$patents
   if (is.null(pats) || length(pats) == 0) return(.empty_signals())
-  do.call(rbind, lapply(pats, function(p) {
+  out <- do.call(rbind, lapply(pats, function(p) {
     org <- ""
     if (!is.null(p$assignees) && length(p$assignees))
       org <- p$assignees[[1]]$assignee_organization %||% ""
@@ -266,21 +345,15 @@ fetch_patentsview <- function(q, days_back, settings) {
       score = 0, stringsAsFactors = FALSE
     )
   }))
+  if (length(pats) >= 100L) out <- .fetch_issue(out, "PatentsView page limit reached; retrieval incomplete")
+  out
 }
 
 # --- EPO OPS (European patents) -------------------------------
 # Requires a free OPS key (OAuth). Stored encrypted per question.
-# If no key configured, skip cleanly.
+# The protocol adapter is not yet implemented.
 fetch_epo_ops <- function(q, days_back, settings) {
-  key <- settings$signal_keys$epo_ops %||% ""
-  if (!nzchar(key)) {
-    message("  [signals] no EPO OPS key configured; skipping EP patents")
-    return(.empty_signals())
-  }
-  # OPS uses OAuth2 + CQL. Full implementation deferred to host (needs the
-  # consumer key/secret exchange). Stub returns empty but documents the path.
-  message("  [signals] EPO OPS configured but client not yet implemented; see TODO")
-  .empty_signals()
+  stop("EPO OPS is not implemented; disable it until a verified adapter is installed")
 }
 
 # ============================================================
@@ -293,6 +366,12 @@ fetch_epo_ops <- function(q, days_back, settings) {
 # to extract headline links. Scrapers are inherently fragile — every
 # result is confidence='unverified' (a lead, not a fact).
 fetch_scrape_target <- function(target, q, days_back) {
+  if (!is.list(target) || length(target$url) != 1L ||
+      is.na(target$url) || !grepl("^https?://", target$url))
+    stop("A scrape target requires an HTTP(S) URL")
+  if (length(target$type) != 1L || !target$type %in% c("rss", "html"))
+    stop("A scrape target type must be rss or html")
+  target$name <- target$name %||% ""
   terms <- tolower(.signal_terms(q))
   matches_terms <- function(text) {
     t <- tolower(text)
@@ -301,41 +380,46 @@ fetch_scrape_target <- function(target, q, days_back) {
   out <- .empty_signals()
   if (identical(target$type, "rss")) {
     feed <- .safe(xml2::read_xml(target$url), paste("rss", target$name))
-    if (inherits(feed, "data.frame")) return(out)  # .safe returned empty
+    if (inherits(feed, "data.frame")) return(.fetch_issue(out, attr(feed, "fetch_error") %||% "RSS fetch failed"))
     items <- xml2::xml_find_all(feed, "//item")
     for (it in items) {
       title <- xml2::xml_text(xml2::xml_find_first(it, "title"))
       link  <- xml2::xml_text(xml2::xml_find_first(it, "link"))
       desc  <- xml2::xml_text(xml2::xml_find_first(it, "description"))
       pub   <- xml2::xml_text(xml2::xml_find_first(it, "pubDate"))
+      if (is.na(link) || !nzchar(link)) next
+      link <- xml2::url_absolute(link, target$url)
+      if (!grepl("^https?://", link)) next
+      date <- .parse_rss_date(pub)
+      if (!is.na(date) && as.Date(date) < Sys.Date() - days_back) next
       if (matches_terms(paste(title, desc))) {
         out <- rbind(out, data.frame(
           signal_type = "press_release",
           source = paste0("press:", .domain(target$url)),
           ext_id = link, title = title %||% "",
           summary = substr(desc %||% "", 1, 1500), org = target$name,
-          signal_date = .parse_rss_date(pub), url = link %||% "",
+          signal_date = date, url = link,
           confidence = "unverified", extra = "{}",
           score = 0, stringsAsFactors = FALSE))
       }
     }
   } else if (identical(target$type, "html")) {
     page <- .safe(rvest::read_html(target$url), paste("html", target$name))
-    if (inherits(page, "data.frame")) return(out)
+    if (inherits(page, "data.frame")) return(.fetch_issue(out, attr(page, "fetch_error") %||% "HTML fetch failed"))
     sel <- target$selector %||% "a"
     links <- rvest::html_elements(page, sel)
     for (lk in links) {
       title <- trimws(rvest::html_text(lk))
       href  <- rvest::html_attr(lk, "href")
-      if (nzchar(title) && matches_terms(title)) {
-        if (!is.null(href) && !grepl("^https?://", href))
-          href <- paste0("https://", .domain(target$url), href)
+      if (!is.na(title) && nzchar(title) && matches_terms(title) && !is.na(href) && nzchar(href)) {
+        href <- xml2::url_absolute(href, target$url)
+        if (!grepl("^https?://", href)) next
         out <- rbind(out, data.frame(
           signal_type = "press_release",
           source = paste0("press:", .domain(target$url)),
           ext_id = href %||% title, title = title,
           summary = "", org = target$name,
-          signal_date = format(Sys.Date(), "%Y-%m-%d"), url = href %||% target$url,
+          signal_date = NA_character_, url = href %||% target$url,
           confidence = "unverified", extra = "{}",
           score = 0, stringsAsFactors = FALSE))
       }
@@ -349,9 +433,10 @@ fetch_scrape_target <- function(target, q, days_back) {
   gsub("https?://", "", m)
 }
 .parse_rss_date <- function(x) {
-  if (is.null(x) || !nzchar(x)) return(format(Sys.Date(), "%Y-%m-%d"))
+  if (is.null(x) || length(x) == 0 || is.na(x) || !nzchar(x)) return(NA_character_)
   d <- suppressWarnings(as.Date(x, format = "%a, %d %b %Y"))
-  if (is.na(d)) format(Sys.Date(), "%Y-%m-%d") else format(d, "%Y-%m-%d")
+  if (is.na(d)) d <- .parse_date(x)
+  as.character(d)
 }
 
 # ============================================================
@@ -362,9 +447,9 @@ fetch_scrape_target <- function(target, q, days_back) {
 # against the question's concept terms.
 # ============================================================
 fetch_curated_feeds <- function(q, sigcfg, days_back, feeds_path = "config/feeds.yaml") {
-  if (!file.exists(feeds_path)) return(.empty_signals())
-  reg <- tryCatch(yaml::read_yaml(feeds_path)$feeds, error = function(e) NULL)
-  if (is.null(reg) || length(reg) == 0) return(.empty_signals())
+  if (!file.exists(feeds_path)) stop("Curated feeds configuration does not exist")
+  reg <- yaml::read_yaml(feeds_path)$feeds
+  if (is.null(reg) || length(reg) == 0) stop("Curated feeds configuration is empty")
 
   # Which feed categories has this question enabled? Default: all of them.
   enabled_cats <- sigcfg$feed_categories
@@ -380,11 +465,14 @@ fetch_curated_feeds <- function(q, sigcfg, days_back, feeds_path = "config/feeds
   }
   cutoff <- Sys.Date() - days_back
 
-  out <- .empty_signals()
+  out <- .empty_signals(); failures <- character(0)
   for (feed in reg) {
     if (!cat_on(feed$signal_type)) next
     parsed <- .safe(xml2::read_xml(feed$url), paste("feed", feed$name))
-    if (inherits(parsed, "data.frame")) next   # .safe returned empty on error
+    if (inherits(parsed, "data.frame")) {
+      failures <- c(failures, paste(feed$name, attr(parsed, "fetch_error")))
+      next
+    }
 
     # Support both RSS (<item>) and Atom (<entry>).
     items <- xml2::xml_find_all(parsed, "//item")
@@ -424,15 +512,13 @@ fetch_curated_feeds <- function(q, sigcfg, days_back, feeds_path = "config/feeds
       ))
     }
   }
+  if (length(failures)) out <- .fetch_issue(out, paste(failures, collapse = "; "))
   out
 }
 
 .parse_feed_date <- function(x) {
-  if (is.null(x) || !nzchar(x)) return(format(Sys.Date(), "%Y-%m-%d"))
-  # try RSS (RFC822) then ISO8601 (Atom)
-  d <- suppressWarnings(as.Date(x, format = "%a, %d %b %Y"))
-  if (is.na(d)) d <- suppressWarnings(as.Date(substr(x, 1, 10)))
-  if (is.na(d)) format(Sys.Date(), "%Y-%m-%d") else format(d, "%Y-%m-%d")
+  # Do not manufacture a fresh event date for unchanged undated feed items.
+  .parse_rss_date(x)
 }
 
 # ============================================================
@@ -440,40 +526,40 @@ fetch_curated_feeds <- function(q, sigcfg, days_back, feeds_path = "config/feeds
 # ============================================================
 fetch_signals <- function(q, sigcfg, settings) {
   days <- q$from_days_back %||% 7
+  safe_signal <- function(expr, label) .safe(expr, label, empty = .empty_signals)
   on <- function(name) {
     v <- sigcfg$sources[[name]]
     isTRUE(v)
   }
   out <- list()
-  if (on("sec_edgar"))     out$sec  <- .safe(fetch_sec_edgar(q, days, settings), "sec_edgar")
-  if (on("nih_reporter"))  out$nih  <- .safe(fetch_nih_reporter(q, days, settings), "nih_reporter")
-  if (on("openfda"))       out$fda  <- .safe(fetch_openfda(q, days, settings), "openfda")
-  if (on("trials"))        out$tr   <- .safe(fetch_trials_ctrdata(q, days, settings), "trials")
-  if (on("patentsview"))   out$pv   <- .safe(fetch_patentsview(q, days, settings), "patentsview")
-  if (on("epo_ops"))       out$epo  <- .safe(fetch_epo_ops(q, days, settings), "epo_ops")
+  if (on("sec_edgar"))     out$sec  <- safe_signal(fetch_sec_edgar(q, days, settings), "sec_edgar")
+  if (on("nih_reporter"))  out$nih  <- safe_signal(fetch_nih_reporter(q, days, settings), "nih_reporter")
+  if (on("openfda"))       out$fda  <- safe_signal(fetch_openfda(q, days, settings), "openfda")
+  if (on("trials"))        out$tr   <- safe_signal(fetch_trials_ctrdata(q, days, settings), "trials")
+  if (on("patentsview"))   out$pv   <- safe_signal(fetch_patentsview(q, days, settings), "patentsview")
+  if (on("epo_ops"))       out$epo  <- safe_signal(fetch_epo_ops(q, days, settings), "epo_ops")
 
   # curated RSS/Atom feeds (journals, institutions, aggregators, trade, news)
   if (on("feeds") || length(sigcfg$feed_categories)) {
-    out$feeds <- .safe(fetch_curated_feeds(q, sigcfg, days), "curated_feeds")
+    out$feeds <- safe_signal(fetch_curated_feeds(q, sigcfg, days), "curated_feeds")
   }
 
-  # commercial pharma-intelligence APIs (Cortellis / Citeline) — only run if
-  # enabled AND credentials exist (the adapter skips cleanly otherwise).
+  # Commercial adapters remain unavailable until their contracted endpoints
+  # and response formats are verified. Enabled stubs report source failure.
   if (on("cortellis"))
-    out$cortellis <- .safe(fetch_pharma_intel("cortellis", q, days, settings), "cortellis")
+    out$cortellis <- safe_signal(fetch_pharma_intel("cortellis", q, days, settings), "cortellis")
   if (on("citeline"))
-    out$citeline  <- .safe(fetch_pharma_intel("citeline", q, days, settings), "citeline")
+    out$citeline  <- safe_signal(fetch_pharma_intel("citeline", q, days, settings), "citeline")
 
   # scrape targets (each its own .safe)
   if (length(sigcfg$scrape_targets)) {
     for (i in seq_along(sigcfg$scrape_targets)) {
       tgt <- sigcfg$scrape_targets[[i]]
-      out[[paste0("scrape_", i)]] <- .safe(
+      out[[paste0("scrape_", i)]] <- safe_signal(
         fetch_scrape_target(tgt, q, days), paste0("scrape:", tgt$name %||% i))
     }
   }
-  res <- do.call(rbind, c(out, list(make.row.names = FALSE)))
-  if (is.null(res)) res <- .empty_signals()
-  attr(res, "source_counts") <- lapply(out, nrow)
+  res <- .fetch_bind(out, empty = .empty_signals)
+  attr(res, "source_counts") <- lapply(out, .fetch_health)
   res
 }

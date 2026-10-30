@@ -3,6 +3,7 @@
 db/*.sqlite
 db/*.sqlite-wal
 db/*.sqlite-shm
+db/*.pipeline.lock
 db/*.replaced-*
 
 # generated output

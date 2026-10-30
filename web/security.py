@@ -10,7 +10,9 @@
 # Fernet key). Generate one with:
 #     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # ============================================================
-import os, json, secrets, hashlib, base64
+import os, json, secrets, time, math
+from collections import OrderedDict
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -107,3 +109,30 @@ def is_expired(expires_at_iso: str) -> bool:
         return datetime.fromisoformat(expires_at_iso) < datetime.now(timezone.utc)
     except Exception:
         return True
+
+
+class AttemptLimiter:
+    """Bounded, thread-safe rate limit for a single web worker.
+
+    Successful attempts count too: possessing a password must not let a client
+    repeatedly create fresh sessions and reset the second-factor budget.
+    State expires naturally and is intentionally reset on service restart.
+    """
+    def __init__(self, limit=20, window_seconds=300, max_clients=2048):
+        self.limit = limit
+        self.window = window_seconds
+        self.max_clients = max_clients
+        self._attempts = OrderedDict()
+        self._lock = Lock()
+
+    def retry_after(self, key):
+        now = time.monotonic()
+        with self._lock:
+            start, count = self._attempts.pop(key, (now, 0))
+            if now - start >= self.window:
+                start, count = now, 0
+            wait = max(1, math.ceil(self.window - (now - start))) if count >= self.limit else 0
+            self._attempts[key] = (start, count + (not wait))
+            while len(self._attempts) > self.max_clients:
+                self._attempts.popitem(last=False)
+            return wait

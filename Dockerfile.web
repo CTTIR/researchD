@@ -5,19 +5,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Upper bounds are deliberate. With open-ended ">=" pins a rebuild six months
-# from now installs whatever is current, so the image is not reproducible and
-# a breaking major release lands silently on the next `--build`. Raise these
-# on purpose, after testing, not by accident at 3am.
-RUN pip install --no-cache-dir \
-      "fastapi>=0.110,<1.0" \
-      "uvicorn[standard]>=0.29,<1.0" \
-      "jinja2>=3.1,<4.0" \
-      "python-multipart>=0.0.9,<1.0" \
-      "bcrypt>=4.1,<6.0" \
-      "pyotp>=2.9,<3.0" \
-      "pydantic>=2.0,<3.0" \
-      "cryptography>=42.0,<51.0"
+COPY requirements-web.txt constraints-python.txt ./
+RUN pip install --no-cache-dir -r requirements-web.txt
 
 COPY web/ ./web/
 COPY db/schema.sql ./db/schema.sql

@@ -1,0 +1,136 @@
+name: Server and connected client
+
+on:
+  push:
+    branches: [main, 'dev/**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      client_ref:
+        description: 'researchR branch, tag or commit to test with this server'
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: researchd-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Offline suites and real HTTP client (R ${{ matrix.r }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        r: ['4.4.1', 'release']
+    defaults:
+      run:
+        working-directory: researchd
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: researchd
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: CTTIR/researchR
+          ref: ${{ inputs.client_ref || 'main' }}
+          path: researchR
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - uses: r-lib/actions/setup-r@f9a764fea8d5c63df6ef9a5c7795bf7deb5d7e05 # v2
+        with:
+          r-version: ${{ matrix.r }}
+          use-public-rspm: true
+      - name: Install test dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements-test.txt
+          .venv/bin/python -m pip check
+          Rscript -e 'install.packages(c("yaml", "DBI", "RSQLite", "filelock", "httr2", "jsonlite", "htmltools", "cli", "rlang", "tibble", "testthat", "pkgload", "withr"), repos = getOption("repos"))'
+      - name: Parse Python and shell sources
+        run: |
+          .venv/bin/python -m compileall -q web scripts dev/tests
+          for script in entrypoint.sh cron.sh scripts/*.sh dev/tests/*.sh; do
+            bash -n "$script"
+          done
+      - name: Offline service and engine regression suites
+        run: PATH="$PWD/.venv/bin:$PATH" dev/tests/run_all.sh
+      - name: researchR against a real disposable HTTP server
+        run: PATH="$PWD/.venv/bin:$PATH" dev/tests/integration_client.sh
+
+  compose:
+    name: Compose build and startup smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare isolated configuration and database
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, secrets, sqlite3
+          values = {
+              "APP_SECRET_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+              "API_TOKEN": secrets.token_hex(32),
+              "WEB_BIND": "127.0.0.1", "WEB_PORT": "8000",
+              "BASE_URL": "http://127.0.0.1:8000", "SECURE_COOKIE": "0",
+              "RUN_ON_START": "0", "SMTP_HOST": "", "EMAIL_PW": "",
+              # No scheduled retrieval can run on this impossible calendar date.
+              "CRON_SCHEDULE": "0 0 31 2 *", "CRON_FAST_SCHEDULE": "0 0 31 2 *",
+          }
+          fd = os.open(".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w") as stream:
+              stream.write("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
+          sources = dict.fromkeys(("pubmed", "europepmc", "openalex", "crossref",
+                                   "semanticscholar", "clinicaltrials", "biorxiv"), False)
+          with sqlite3.connect("db/pipeline.sqlite") as con:
+              con.executescript(pathlib.Path("db/schema.sql").read_text())
+              con.execute("INSERT INTO questions(id,label,sources,delivery,email_enabled) VALUES(?,?,?,?,0)",
+                          ("ci", "Synthetic startup question", json.dumps(sources), "[]"))
+              con.execute("INSERT INTO concepts(question_id,name,position,terms,mesh) VALUES(?,?,?,?,?)",
+                          ("ci", "test", 0, '["synthetic"]', "[]"))
+          PY
+      - name: Build and start all services
+        run: |
+          docker compose config --quiet
+          docker compose build
+          docker compose up -d
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8000/healthz; then break; fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8000/healthz
+      - name: Run the container engine without external retrieval or delivery
+        run: |
+          docker compose exec -T pipeline Rscript R/run_all.R ci
+          python3 - <<'PY'
+          import json, pathlib, sqlite3, urllib.request
+          env = dict(line.split("=", 1) for line in pathlib.Path(".env").read_text().splitlines())
+          req = urllib.request.Request("http://127.0.0.1:8000/api/v1/questions",
+                                       headers={"Authorization": "Bearer " + env["API_TOKEN"]})
+          with urllib.request.urlopen(req, timeout=10) as response:
+              data = json.load(response)
+          assert data[0]["id"] == "ci", data
+          with sqlite3.connect("db/pipeline.sqlite") as con:
+              assert con.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
+              assert con.execute("SELECT last_ok FROM service_heartbeat WHERE service='pipeline'").fetchone()[0]
+          PY
+      - name: Show service state
+        if: always()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=100
+      - name: Stop services
+        if: always()
+        run: docker compose down
