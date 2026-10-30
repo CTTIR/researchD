@@ -7,8 +7,8 @@
 #   scripts/prune.sh db/pipeline.sqlite digests 24 60
 #
 # Cron it monthly on the HOST:
-#   0 4 1 * * /srv/researchd/scripts/prune.sh \
-#             /srv/researchd/db/pipeline.sqlite /srv/researchd/digests
+#   0 4 1 * * /srv/researchD/scripts/prune.sh \
+#             /srv/researchD/db/pipeline.sqlite /srv/researchD/digests
 #
 # What it does, and what it deliberately does NOT do:
 #

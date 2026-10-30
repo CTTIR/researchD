@@ -75,7 +75,7 @@ ensure_packages <- function(pkgs = CORE_PKGS) {
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing)) {
     stop("Missing required R packages: ", paste(missing, collapse = ", "),
-      ". Install them before starting researchd: install.packages(c(",
+      ". Install them before starting researchD: install.packages(c(",
       paste(sprintf('"%s"', missing), collapse = ", "),
       '), repos = "https://cloud.r-project.org")', call. = FALSE)
   }

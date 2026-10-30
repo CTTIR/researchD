@@ -1,5 +1,10 @@
 # Connected maintenance release
 
+Repository naming update, 2026-10-30: `CTTIR/researchd` and its local checkout
+were renamed to `CTTIR/researchD` / `researchD`. The audit below preserves the
+original name in historical evidence. Current installation links and CI paths
+use `researchD`; service endpoints, database formats and credentials are unchanged.
+
 Baselines: researchd `ac71e59a1fa6484c2a82d0b32165af4956b6eaf3` and researchR
 `3e1abfeca85dd5d7390a0f19916df9ba73ea3a57`. Both CTTIR checkouts were clean and
 matched GitHub main on 2026-10-30. Work uses `dev/connected-hardening-20261030`.

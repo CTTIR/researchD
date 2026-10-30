@@ -9,11 +9,11 @@
 #
 # Usage:
 #   scripts/backup.sh <db-path> <backup-dir> [keep]
-#   scripts/backup.sh db/pipeline.sqlite /var/backups/researchd 14
+#   scripts/backup.sh db/pipeline.sqlite /var/backups/researchD 14
 #
 # Cron it on the HOST (the container has no scheduler for this):
-#   0 3 * * * /srv/researchd/scripts/backup.sh \
-#             /srv/researchd/db/pipeline.sqlite /var/backups/researchd
+#   0 3 * * * /srv/researchD/scripts/backup.sh \
+#             /srv/researchD/db/pipeline.sqlite /var/backups/researchD
 #
 # ALSO BACK UP APP_SECRET_KEY, separately and somewhere else. It is not in
 # the database. Without it, the per-question API keys in a restored backup

@@ -3,7 +3,7 @@
 # Restore a backup taken by scripts/backup.sh.
 #
 #   docker compose down            # nothing may be writing during a restore
-#   scripts/restore.sh /var/backups/researchd/pipeline-20260826-030000.sqlite \
+#   scripts/restore.sh /var/backups/researchD/pipeline-20260826-030000.sqlite \
 #                      db/pipeline.sqlite
 #   docker compose up -d
 #

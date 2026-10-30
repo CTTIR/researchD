@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: researchd-ci-${{ github.workflow }}-${{ github.ref }}
+  group: researchD-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,11 +29,11 @@ jobs:
         r: ['4.4.1', 'release']
     defaults:
       run:
-        working-directory: researchd
+        working-directory: researchD
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: researchd
+          path: researchD
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

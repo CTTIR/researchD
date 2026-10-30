@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed a throwaway researchd DB for the researchR client integration run."""
+"""Seed a throwaway researchD DB for the researchR client integration run."""
 import json, os, pathlib, sqlite3, sys
 
 db = pathlib.Path(sys.argv[1]).resolve()

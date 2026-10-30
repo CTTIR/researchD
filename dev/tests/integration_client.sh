@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# End-to-end: the researchR R client against a real, running researchd.
+# End-to-end: the researchR R client against a real, running researchD.
 #
 # Starts a throwaway uvicorn on a free port with a seeded scratch database,
 # points the package's integration tests at it, and tears it down again.
 # This is the only test that exercises both halves of the project together.
 # ===========================================================================
 set -euo pipefail
-cd "$(dirname "$0")/../.."               # researchd/
+cd "$(dirname "$0")/../.."               # researchD/
 RD="$PWD"
 
 # researchR lives in its own repository. Point RESEARCHR_PKG at your checkout,
@@ -26,7 +26,7 @@ if [ ! -x "$PY" ]; then
   exit 2
 fi
 
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/researchd-client.XXXXXX")"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/researchD-client.XXXXXX")"
 DB="$SCRATCH/integration.sqlite"
 TOKEN="integration-token-$$"
 LOG="$SCRATCH/server.log"
@@ -84,7 +84,7 @@ SERVER=$!
 READY=0
 for ((attempt=0; attempt<50; attempt++)); do
   if ! kill -0 "$SERVER" 2>/dev/null; then
-    echo "[integration] researchd exited before becoming ready" >&2
+    echo "[integration] researchD exited before becoming ready" >&2
     exit 1
   fi
   if [ -s "$PORT_FILE" ] && "$PY" - "$PORT_FILE" <<'PY' 2>/dev/null
@@ -99,12 +99,12 @@ PY
   sleep 0.2
 done
 if [ "$READY" -ne 1 ] || ! kill -0 "$SERVER" 2>/dev/null; then
-  echo "[integration] researchd did not become ready within the startup timeout" >&2
+  echo "[integration] researchD did not become ready within the startup timeout" >&2
   exit 1
 fi
 PORT="$(cat "$PORT_FILE")"
 
-echo "[integration] researchd up on port $PORT; running the researchR suite"
+echo "[integration] researchD up on port $PORT; running the researchR suite"
 cd "$PKG"
 R_LIBS="$RD/dev/state/tmp/Rlib" \
 RESEARCHR_TEST_URL="http://127.0.0.1:$PORT" \

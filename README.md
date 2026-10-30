@@ -1,4 +1,4 @@
-# researchd
+# researchD
 
 Self-hosted literature and signal surveillance for research teams. Define a
 question, retrieve overlapping sources on a schedule, inspect ranked results,
@@ -29,7 +29,7 @@ pagination; configure one in the question's encrypted API keys. See the
 PatentSearch requires a PatentsView key; its adapter uses the current
 `X-Api-Key` header. Semantic Scholar may rate-limit keyless access. Sources
 requiring registration or subscription are not made accessible by installing
-researchd. WHO ICTRP and comprehensive worldwide trial-registry coverage are
+researchD. WHO ICTRP and comprehensive worldwide trial-registry coverage are
 outside the present scope.
 
 `config/settings.yaml` sets `fetch.max_records` (default 5000; values above
@@ -70,8 +70,8 @@ scheduler images use Python 3.12. Native development supports R 4.4+ and
 Python 3.12+.
 
 ```bash
-git clone https://github.com/CTTIR/researchd.git
-cd researchd
+git clone https://github.com/CTTIR/researchD.git
+cd researchD
 python3 - <<'PYENV'
 import base64, os, pathlib, re, secrets
 values = {
@@ -227,7 +227,7 @@ Back up SQLite through its backup API, not by copying an actively written
 main database without its WAL:
 
 ```bash
-scripts/backup.sh db/pipeline.sqlite /var/backups/researchd 14
+scripts/backup.sh db/pipeline.sqlite /var/backups/researchD 14
 ```
 
 The Python 3 helper checks integrity, gives each snapshot a unique filename,
@@ -238,7 +238,7 @@ database together with any WAL/SHM recovery files:
 
 ```bash
 docker compose down
-scripts/restore.sh /var/backups/researchd/pipeline-YYYYMMDD-HHMMSS-SUFFIX.sqlite db/pipeline.sqlite
+scripts/restore.sh /var/backups/researchD/pipeline-YYYYMMDD-HHMMSS-SUFFIX.sqlite db/pipeline.sqlite
 docker compose up -d
 ```
 
