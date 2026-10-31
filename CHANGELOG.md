@@ -19,6 +19,8 @@ data remain compatible.
   consistent dashboard question snapshot across asynchronous requests.
 - Extend real HTTP, migration, engine and Compose delivery checks. The Compose
   smoke uses synthetic data and an isolated SMTP capture, with no external sends.
+- Install the `libjq` headers needed by ARM source builds and exercise Compose
+  on both x86-64 and ARM64 runners, with bounded R package build concurrency.
 
 Back up the database and matching encryption key before upgrading. All three
 services must use this revision; the additive `auth.totp_last_step` migration

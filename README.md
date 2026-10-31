@@ -69,6 +69,9 @@ Prerequisites: Docker Engine/Desktop with Compose v2, Git, and Python 3 for
 one-time secret generation. The pipeline image uses R 4.4.1; the web and
 scheduler images use Python 3.12. Native server development on Linux/macOS
 supports R 4.4+ and Python 3.12+; Windows hosts should use Linux containers.
+ARM builds compile R packages from source. The image includes their system
+libraries and uses two package-install workers; pass
+`docker compose build --build-arg R_INSTALL_CPUS=1` to reduce build concurrency.
 
 ```bash
 git clone https://github.com/CTTIR/researchD.git
@@ -305,7 +308,7 @@ successes. It may incur provider quota usage and requires the full adapter
 dependencies and any source credentials.
 
 GitHub Actions defines the offline/native client integration and a separate
-Compose build/start smoke test, including file export, RSS and an isolated SMTP
+Compose build/start smoke test on x86-64 and ARM64, including file export, RSS and an isolated SMTP
 socket that captures a synthetic message without forwarding it. The workflow can be dispatched with a
 `client_ref` to test a matching researchR branch or commit; ordinary runs use
 its main branch. Configuring this workflow does not establish that a hosted

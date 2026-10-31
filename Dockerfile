@@ -5,12 +5,13 @@
 FROM rocker/r-ver:4.4.1
 
 # --- system libraries needed by the R package stack ----------
-# curl/httr2 -> libcurl; xml2 (europepmc) -> libxml2; openssl -> libssl
+# curl/httr2 -> libcurl; xml2 -> libxml2; openssl -> libssl; jqr -> libjq
 # cron for in-container scheduling; tzdata so timestamps are sane
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libcurl4-openssl-dev \
       libssl-dev \
       libxml2-dev \
+      libjq-dev \
       cron \
       tzdata \
       ca-certificates \
@@ -28,7 +29,8 @@ RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezo
 # pinned rocker base tag above, whose built-in repo is a dated CRAN snapshot.
 # That is a deliberate trade-off -- change the base tag and the package set
 # moves with it, so treat a base-image bump as a dependency upgrade.
-RUN install2.r --error --skipinstalled \
+ARG R_INSTALL_CPUS=2
+RUN install2.r --error --skipinstalled --ncpus "${R_INSTALL_CPUS}" \
       yaml \
       rentrez \
       europepmc \
