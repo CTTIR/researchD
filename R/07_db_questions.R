@@ -18,7 +18,8 @@ DB_MIGRATIONS <- list(
   list("signal_config", "feed_categories", "TEXT DEFAULT '{}'"),
   list("signal_config", "instant_alerts",  "INTEGER DEFAULT 0"),
   list("records",       "oa_url",          "TEXT"),
-  list("records",       "provenance",      "TEXT DEFAULT '[]'")
+  list("records",       "provenance",      "TEXT DEFAULT '[]'"),
+  list("auth",          "totp_last_step",  "INTEGER DEFAULT -1")
 )
 
 db_migrate <- function(con) {
@@ -75,10 +76,36 @@ db_init_schema <- function(con, schema_path = "db/schema.sql") {
 
 # JSON parsers may echo the failing input. Report the field, never stored key
 # material or private concept text, when a persisted configuration is corrupt.
-.read_config_json <- function(value, field, default) {
-  tryCatch(jsonlite::fromJSON(value %||% default), error = function(e)
+.read_config_json <- function(value, field, default, simplify = TRUE) {
+  tryCatch(jsonlite::fromJSON(value %||% default, simplifyVector = simplify), error = function(e)
     stop("Invalid JSON in ", field, call. = FALSE))
 }
+
+.config_map <- function(value, field, kind = c("logical", "character"), allowed = NULL) {
+  kind <- match.arg(kind)
+  if (!length(value)) return(list())
+  if (is.null(names(value)) || any(!nzchar(names(value))) || anyDuplicated(names(value)) ||
+      (!is.null(allowed) && any(!names(value) %in% allowed)) ||
+      !all(vapply(value, function(x) length(x) == 1L && !is.na(x) &&
+        if (kind == "logical") is.logical(x) else is.character(x), logical(1))))
+    stop("Invalid ", kind, " object in ", field, call. = FALSE)
+  as.list(value)
+}
+
+.config_text_array <- function(value, field) {
+  if (!length(value)) return(character(0))
+  if (is.list(value)) {
+    if (!all(vapply(value, function(x) is.character(x) && length(x) == 1L, logical(1))))
+      stop("Invalid text array in ", field, call. = FALSE)
+    value <- unlist(value, use.names = FALSE)
+  }
+  if (!is.character(value) || anyNA(value) || any(!nzchar(trimws(value))))
+    stop("Invalid text array in ", field, call. = FALSE)
+  unname(value)
+}
+
+.LITERATURE_SOURCES <- c("pubmed", "europepmc", "openalex", "semanticscholar",
+                        "crossref", "clinicaltrials", "biorxiv")
 
 # Read all enabled questions from the DB into the list shape the
 # pipeline expects, including per-question sources + decrypted keys.
@@ -111,14 +138,16 @@ load_questions_db <- function(con, selected_ids = character(0)) {
     concepts <- lapply(seq_len(nrow(cons)), function(j) {
       list(
         name  = cons$name[j],
-        terms = .read_config_json(cons$terms[j], "concepts.terms", "[]"),
-        mesh  = .read_config_json(cons$mesh[j], "concepts.mesh", "[]")
+        terms = .config_text_array(.read_config_json(cons$terms[j], "concepts.terms", "[]"), "concepts.terms"),
+        mesh  = .config_text_array(.read_config_json(cons$mesh[j], "concepts.mesh", "[]"), "concepts.mesh")
       )
     })
     # per-question source toggles (default: all on if unspecified)
-    src_obj <- .read_config_json(q$sources, "questions.sources", "{}")
+    src_obj <- .config_map(.read_config_json(q$sources, "questions.sources", "{}"),
+                           "questions.sources", allowed = .LITERATURE_SOURCES)
     # decrypt per-source API keys
-    key_obj_enc <- .read_config_json(q$api_keys_enc, "questions.api_keys_enc", "{}")
+    key_obj_enc <- .config_map(.read_config_json(q$api_keys_enc, "questions.api_keys_enc", "{}"),
+                               "questions.api_keys_enc", kind = "character")
     api_keys <- lapply(key_obj_enc, .decrypt_key)
 
     list(
@@ -139,28 +168,70 @@ load_questions_db <- function(con, selected_ids = character(0)) {
 
 # One-time seed: import questions.yaml into the DB if empty.
 seed_questions_from_yaml <- function(con, yaml_path = "config/questions.yaml") {
-  n <- DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM questions")$n
-  if (n > 0 || !file.exists(yaml_path)) return(invisible())
-  ql <- yaml::read_yaml(yaml_path)$questions
-  for (q in ql) {
-    DBI::dbExecute(con,
-      "INSERT INTO questions(id,label,study_filter,from_days_back,delivery)
-       VALUES(?,?,?,?,?)",
-      params = list(q$id, q$label,
-                    jsonlite::toJSON(q$study_filter %||% list(), auto_unbox = TRUE),
-                    q$from_days_back %||% 7,
-                    jsonlite::toJSON(q$delivery %||% c("file"), auto_unbox = TRUE)))
-    for (k in seq_along(q$concepts)) {
-      con_ <- q$concepts[[k]]
-      DBI::dbExecute(con,
-        "INSERT INTO concepts(question_id,name,position,terms,mesh)
-         VALUES(?,?,?,?,?)",
-        params = list(q$id, con_$name, k - 1,
-                      jsonlite::toJSON(con_$terms %||% list(), auto_unbox = TRUE),
-                      jsonlite::toJSON(con_$mesh %||% list(), auto_unbox = TRUE)))
+  if (!file.exists(yaml_path)) return(invisible())
+  DBI::dbWithTransaction(con, (function() {
+    n <- DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM questions")$n
+    if (n > 0L) return(invisible())
+    ql <- yaml::read_yaml(yaml_path)$questions
+    if (is.null(ql)) ql <- list()
+    if (!is.list(ql)) stop("questions.yaml questions must be a list", call. = FALSE)
+    text <- function(x, field) {
+      if (!is.character(x) || length(x) != 1L || is.na(x) || !nzchar(trimws(x)))
+        stop("Invalid text in questions.yaml ", field, call. = FALSE)
+      x
     }
-  }
-  message("Seeded ", length(ql), " question(s) from YAML into DB.")
+    flag <- function(x, field, default) {
+      if (is.null(x)) return(default)
+      if (!is.logical(x) || length(x) != 1L || is.na(x))
+        stop("Invalid boolean in questions.yaml ", field, call. = FALSE)
+      x
+    }
+    array_json <- function(x, field) as.character(jsonlite::toJSON(
+      as.list(.config_text_array(x, field)), auto_unbox = TRUE))
+    for (q in ql) {
+      if (!is.list(q)) stop("Each YAML question must be an object", call. = FALSE)
+      allowed <- c("id", "label", "concepts", "study_filter", "from_days_back", "delivery",
+                   "enabled", "sources", "digest_mode", "min_score", "email_enabled", "email_cron", "email_to")
+      if (any(!names(q) %in% allowed))
+        stop("Unsupported field in questions.yaml; configure API keys through the dashboard", call. = FALSE)
+      id <- text(q$id, "id"); label <- text(q$label, "label")
+      if (!grepl("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", id)) stop("Invalid YAML question id", call. = FALSE)
+      days <- q$from_days_back %||% 7
+      if (!is.numeric(days) || length(days) != 1L || !is.finite(days) || days < 1 || days != floor(days))
+        stop("YAML from_days_back must be a positive integer", call. = FALSE)
+      delivery <- if (is.null(q$delivery)) "file" else .config_text_array(q$delivery, "delivery")
+      # Keep the legacy email channel readable; scheduling remains governed by
+      # email_enabled, email_to and email_cron, as for dashboard questions.
+      if (any(!delivery %in% c("file", "email", "zotero"))) stop("Unsupported YAML delivery channel", call. = FALSE)
+      mode <- q$digest_mode %||% "all"
+      if (length(mode) != 1L || !mode %in% c("all", "threshold")) stop("Invalid YAML digest_mode", call. = FALSE)
+      score <- q$min_score %||% 0
+      if (!is.numeric(score) || length(score) != 1L || !is.finite(score)) stop("Invalid YAML min_score", call. = FALSE)
+      sources <- .config_map(q$sources %||% list(), "YAML sources", allowed = .LITERATURE_SOURCES)
+      sources_json <- if (length(sources)) as.character(jsonlite::toJSON(sources, auto_unbox = TRUE)) else "{}"
+      DBI::dbExecute(con,
+        "INSERT INTO questions(id,label,study_filter,from_days_back,delivery,enabled,sources,
+         digest_mode,min_score,email_enabled,email_cron,email_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        params = list(id, label, array_json(q$study_filter, "study_filter"), days,
+          array_json(delivery, "delivery"), as.integer(flag(q$enabled, "enabled", TRUE)),
+          sources_json, mode, score, as.integer(flag(q$email_enabled, "email_enabled", FALSE)),
+          text(q$email_cron %||% "0 7 * * 1", "email_cron"), array_json(q$email_to, "email_to")))
+      if (!is.list(q$concepts) || !length(q$concepts)) stop("YAML question requires concepts", call. = FALSE)
+      for (k in seq_along(q$concepts)) {
+        concept <- q$concepts[[k]]
+        if (!is.list(concept)) stop("YAML concept must be an object", call. = FALSE)
+        terms <- .config_text_array(concept$terms, "concept terms")
+        mesh <- .config_text_array(concept$mesh, "concept MeSH")
+        if (!length(terms) && !length(mesh)) stop("YAML concept requires terms or MeSH headings", call. = FALSE)
+        DBI::dbExecute(con,
+          "INSERT INTO concepts(question_id,name,position,terms,mesh) VALUES(?,?,?,?,?)",
+          params = list(id, text(concept$name, "concept name"), k - 1L,
+                        array_json(terms, "terms"), array_json(mesh, "mesh")))
+      }
+    }
+    if (length(ql)) message("Seeded ", length(ql), " question(s) from YAML into DB.")
+  })())
+  invisible(NULL)
 }
 
 # Persist new records (full schema) and return only the genuinely new

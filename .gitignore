@@ -4,6 +4,7 @@ db/*.sqlite
 db/*.sqlite-wal
 db/*.sqlite-shm
 db/*.pipeline.lock
+db/*.scheduler.lock
 db/*.replaced-*
 
 # generated output

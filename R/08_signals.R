@@ -174,18 +174,29 @@ fetch_openfda <- function(q, days_back, settings) {
       issue <- "openFDA page request failed; retrieval incomplete"
       break
     }
-    if (httr2::resp_status(resp) == 404L) break
-    js <- httr2::resp_body_json(resp)
+    if (httr2::resp_status(resp) == 404L) {
+      if (length(results)) issue <- "openFDA ended before its reported total; retrieval incomplete"
+      break
+    }
+    js <- tryCatch(httr2::resp_body_json(resp), error = identity)
+    if (inherits(js, "error")) {
+      if (!length(results)) stop(js)
+      issue <- "openFDA page response could not be parsed; retrieval incomplete"
+      break
+    }
     page <- js$results %||% list()
     results <- c(results, page)
     total <- js$meta$results$total %||% length(results)
-    if (!length(page) || length(results) >= total) break
+    if (!length(page) || length(results) >= total) {
+      if (length(results) < total) issue <- "openFDA ended before its reported total; retrieval incomplete"
+      break
+    }
     if (length(results) >= limit) {
       issue <- "openFDA result limit reached; retrieval incomplete"
       break
     }
   }
-  if (length(results) == 0) return(.empty_signals())
+  if (length(results) == 0) return(if (is.null(issue)) .empty_signals() else .fetch_issue(.empty_signals(), issue))
   out <- do.call(rbind, lapply(results, function(r) {
     openfda <- r$openfda %||% list()
     brand <- paste(unlist(openfda$brand_name), collapse = "; ")
@@ -213,7 +224,8 @@ fetch_openfda <- function(q, days_back, settings) {
 # its native API. CTIS/ISRCTN remain registry leads imported with ctrdata; an
 # import timestamp is never presented as a registration or results date.
 .ctgov_signals <- function(studies) {
-  if (!length(studies)) return(.empty_signals())
+  if (!length(studies)) return(if (is.null(attr(studies, "fetch_error"))) .empty_signals()
+    else .fetch_issue(.empty_signals(), attr(studies, "fetch_error")))
   out <- lapply(studies, function(study) {
     p <- study$protocolSection
     id <- p$identificationModule$nctId %||% ""
@@ -526,7 +538,8 @@ fetch_curated_feeds <- function(q, sigcfg, days_back, feeds_path = "config/feeds
 # ============================================================
 fetch_signals <- function(q, sigcfg, settings) {
   days <- q$from_days_back %||% 7
-  safe_signal <- function(expr, label) .safe(expr, label, empty = .empty_signals)
+  safe_signal <- function(expr, label) .safe(expr, label, empty = .empty_signals,
+                                            secrets = settings$signal_keys)
   on <- function(name) {
     v <- sigcfg$sources[[name]]
     isTRUE(v)

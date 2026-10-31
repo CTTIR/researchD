@@ -21,11 +21,26 @@
 # quiet month -- the single worst failure mode of a surveillance system. The
 # failure is recorded on the frame so fetch_question() can pass it through to
 # fetch_log().
-.safe <- function(expr, label, empty = .empty_records) {
+.fetch_diagnostic <- function(error, secrets = character(0)) {
+  detail <- conditionMessage(error)
+  secrets <- unique(as.character(unlist(secrets, use.names = FALSE)))
+  for (secret in secrets[!is.na(secrets) & nzchar(secrets)]) {
+    detail <- gsub(secret, "[redacted]", detail, fixed = TRUE)
+    detail <- gsub(utils::URLencode(secret, reserved = TRUE), "[redacted]", detail, fixed = TRUE)
+  }
+  detail <- gsub("(?i)([?&](?:api_key|apikey|key|access_token|token)=)[^&[:space:]<>]+",
+                 "\\1[redacted]", detail, perl = TRUE)
+  detail <- gsub("(?i)(https?://)[^/@[:space:]]+:[^/@[:space:]]+@",
+                 "\\1[redacted]@", detail, perl = TRUE)
+  detail
+}
+
+.safe <- function(expr, label, empty = .empty_records, secrets = character(0)) {
   tryCatch(expr, error = function(e) {
-    message(sprintf("  [WARN] %s failed: %s", label, conditionMessage(e)))
+    detail <- .fetch_diagnostic(e, secrets)
+    message(sprintf("  [WARN] %s failed: %s", label, detail))
     out <- empty()
-    attr(out, "fetch_error") <- conditionMessage(e)
+    attr(out, "fetch_error") <- detail
     out
   })
 }
@@ -176,7 +191,10 @@ fetch_openalex <- function(concept_terms, days_back, settings) {
     works <- c(works, page)
     next_cursor <- js$meta$next_cursor
     total <- js$meta$count %||% length(works)
-    if (!length(page) || length(works) >= total || is.null(next_cursor)) break
+    if (!length(page) || length(works) >= total || is.null(next_cursor)) {
+      if (length(works) < total) issue <- "OpenAlex ended before its reported total; retrieval incomplete"
+      break
+    }
     if (!nzchar(key)) {
       issue <- "OpenAlex requires an API key for continued cursor paging; retrieval incomplete"
       break
@@ -187,7 +205,7 @@ fetch_openalex <- function(concept_terms, days_back, settings) {
     }
     seen <- c(seen, cursor); cursor <- next_cursor
   }
-  if (!length(works)) return(.empty_records())
+  if (!length(works)) return(if (is.null(issue)) .empty_records() else .fetch_issue(.empty_records(), issue))
   out <- do.call(rbind, lapply(works, function(w) {
     doi <- sub("^https?://doi.org/", "", w$doi %||% "")
     data.frame(source = "openalex", ext_id = w$id %||% "", doi = doi,
@@ -265,7 +283,8 @@ fetch_openalex <- function(concept_terms, days_back, settings) {
 
 fetch_clinicaltrials <- function(query, days_back, settings) {
   studies <- .fetch_ctgov_studies(query, days_back, settings)
-  if (length(studies) == 0) return(.empty_records())
+  if (length(studies) == 0) return(if (is.null(attr(studies, "fetch_error"))) .empty_records()
+    else .fetch_issue(.empty_records(), attr(studies, "fetch_error")))
   out <- do.call(rbind, lapply(studies, function(s) {
     p <- s$protocolSection
     nct <- p$identificationModule$nctId %||% ""
@@ -361,7 +380,10 @@ fetch_semanticscholar <- function(concept_terms, days_back, settings) {
         records <- c(records, page)
         offset <- offset + length(page)
         total <- js$total %||% offset
-        if (!length(page) || offset >= total || is.null(js$`next`)) break
+        if (!length(page) || offset >= total || is.null(js$`next`)) {
+          if (offset < total) issues <<- c(issues, "Semantic Scholar ended before its reported total; retrieval incomplete")
+          break
+        }
         if (offset >= limit || js$`next` < offset) {
           issues <<- c(issues, "Semantic Scholar relevance-search limit reached; retrieval incomplete")
           break
@@ -442,14 +464,17 @@ fetch_crossref <- function(query, days_back, settings) {
     items <- c(items, page)
     next_cursor <- js$message$`next-cursor`
     total <- js$message$`total-results` %||% length(items)
-    if (!length(page) || length(items) >= total || is.null(next_cursor)) break
+    if (!length(page) || length(items) >= total || is.null(next_cursor)) {
+      if (length(items) < total) issue <- "Crossref ended before its reported total; retrieval incomplete"
+      break
+    }
     if (length(items) >= limit || next_cursor %in% seen) {
       issue <- "Crossref result limit or repeated cursor; retrieval incomplete"
       break
     }
     seen <- c(seen, cursor); cursor <- next_cursor
   }
-  if (length(items) == 0) return(.empty_records())
+  if (length(items) == 0) return(if (is.null(issue)) .empty_records() else .fetch_issue(.empty_records(), issue))
   out <- do.call(rbind, lapply(items, function(it) {
     title <- paste(unlist(it$title), collapse = " ")
     if (!nzchar(title)) return(NULL)
@@ -530,22 +555,25 @@ fetch_question <- function(q, queries, settings) {
   s_local$ncbi$api_key <- key_for("pubmed", settings$ncbi$api_key %||% "")
   s_local$semanticscholar$api_key <- key_for("semanticscholar", settings$semanticscholar$api_key %||% "")
   s_local$openalex$api_key <- key_for("openalex", settings$openalex$api_key %||% Sys.getenv("OPENALEX_API_KEY", ""))
+  secrets <- c(unlist(q$api_keys, use.names = FALSE), s_local$ncbi$api_key,
+               s_local$semanticscholar$api_key, s_local$openalex$api_key,
+               Sys.getenv("ENTREZ_KEY", ""))
 
   recs <- list()
   if (src_on("pubmed"))
-    recs$pubmed <- .safe(fetch_pubmed(queries$pubmed, days, s_local), "pubmed")
+    recs$pubmed <- .safe(fetch_pubmed(queries$pubmed, days, s_local), "pubmed", secrets = secrets)
   if (src_on("europepmc"))
-    recs$epmc <- .safe(fetch_europepmc(queries$europepmc, days, s_local), "europepmc")
+    recs$epmc <- .safe(fetch_europepmc(queries$europepmc, days, s_local), "europepmc", secrets = secrets)
   if (src_on("openalex"))
-    recs$oa <- .safe(fetch_openalex(queries$openalex, days, s_local), "openalex")
+    recs$oa <- .safe(fetch_openalex(queries$openalex, days, s_local), "openalex", secrets = secrets)
   if (src_on("semanticscholar"))
-    recs$s2 <- .safe(fetch_semanticscholar(queries$semanticscholar, days, s_local), "semanticscholar")
+    recs$s2 <- .safe(fetch_semanticscholar(queries$semanticscholar, days, s_local), "semanticscholar", secrets = secrets)
   if (src_on("crossref"))
-    recs$cr <- .safe(fetch_crossref(queries$crossref, days, s_local), "crossref")
+    recs$cr <- .safe(fetch_crossref(queries$crossref, days, s_local), "crossref", secrets = secrets)
   if (src_on("clinicaltrials"))
-    recs$ct <- .safe(fetch_clinicaltrials(queries$clinicaltrials, days, s_local), "clinicaltrials")
+    recs$ct <- .safe(fetch_clinicaltrials(queries$clinicaltrials, days, s_local), "clinicaltrials", secrets = secrets)
   if (src_on("biorxiv"))
-    recs$bio <- .safe(fetch_biorxiv(queries$biorxiv_match, days, s_local), "biorxiv")
+    recs$bio <- .safe(fetch_biorxiv(queries$biorxiv_match, days, s_local), "biorxiv", secrets = secrets)
 
   out <- .fetch_bind(recs)
   # Per-source health. Each entry carries the row count AND whether the fetch

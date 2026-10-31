@@ -24,8 +24,15 @@
 #     below handles it explicitly.
 .parse_date <- function(x) {
   if (is.null(x)) return(.as_na_date(1L))
-  x <- as.character(x)
+  x <- trimws(as.character(x))
   if (length(x) == 0) return(.as_na_date(0L))
+  # as.Date with an explicit format accepts trailing junk. Admit only the
+  # documented date shapes so malformed upstream values cannot become dates.
+  time <- "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]+)?(Z|[+-]([01][0-9]|2[0-3]):?[0-5][0-9])?"
+  valid <- !is.na(x) & (grepl("^[0-9]{8}$|^[0-9]{4}$|^[0-9]{4}(-[0-9]{1,2}(-[0-9]{1,2})?|/[0-9]{1,2}(/[0-9]{1,2})?)$", x) |
+    grepl("^[0-9]{4} [A-Za-z]+( [0-9]{1,2})?$", x) |
+    grepl(paste0("^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]", time, "$"), x))
+  x[!valid] <- NA_character_
   out <- .as_na_date(length(x))
   compact <- !is.na(x) & grepl("^[0-9]{8}$", x)
   if (any(compact))

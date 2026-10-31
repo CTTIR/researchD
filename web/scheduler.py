@@ -16,7 +16,8 @@
 #   SMTP_HOST, SMTP_PORT, SMTP_USER, EMAIL_PW, SMTP_FROM
 #   SMTP_TLS = starttls | ssl | none
 # ============================================================
-import os, json, time, sqlite3, smtplib, ssl
+import os, json, time, sqlite3, smtplib, ssl, fcntl, math
+from functools import wraps
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from html import escape
@@ -56,6 +57,37 @@ def db():
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=10000;")
     return con
+
+
+def _single_sender(fn):
+    """Serialize all email lanes/processes without holding a DB write lock.
+
+    The sidecar must remain in place: unlinking an active lock file permits a
+    different process to lock a new inode. A crash releases the OS lock.
+    """
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with open(os.path.realpath(DB_PATH) + ".scheduler.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("[scheduler] another sender is active; this tick will retry", flush=True)
+                return False
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    return guarded
+
+
+def _recipients(q):
+    recipients = json.loads(q["email_to"] or "[]")
+    if (not isinstance(recipients, list) or not recipients or
+            any(not isinstance(value, str) or "@" not in value or
+                any(char.isspace() or ord(char) < 32 for char in value)
+                for value in recipients)):
+        raise ValueError("Enabled email requires a nonempty list of recipient addresses")
+    return recipients
 
 
 def now_local():
@@ -242,9 +274,13 @@ def send_email(to_list, subject, html):
 
 
 def _send_digest(con, q, now):
-    to_list = json.loads(q["email_to"] or "[]")
-    if not to_list:
-        return True
+    to_list = _recipients(q)
+    cron = q["email_cron"] or ""
+    if len(cron.split()) != 5 or not croniter.is_valid(cron):
+        raise ValueError("Invalid five-field email schedule")
+    mode = (q["digest_mode"] if "digest_mode" in q.keys() else "all") or "all"
+    if mode not in ("all", "threshold"):
+        raise ValueError("Invalid digest mode")
     if not is_due(q["email_cron"], q["email_last_sent"], now):
         return True
     # Recall safety-valve: email the high-signal stream. Records below the
@@ -253,8 +289,10 @@ def _send_digest(con, q, now):
     # lower the threshold they can still go out.
     threshold_sql = ""
     params = [q["id"]]
-    if (q["digest_mode"] if "digest_mode" in q.keys() else "all") == "threshold":
+    if mode == "threshold":
         ms = q["min_score"] if "min_score" in q.keys() else 0
+        if not math.isfinite(float(ms or 0)):
+            raise ValueError("Digest threshold must be finite")
         threshold_sql = " AND score >= ?"
         params.append(float(ms or 0))
     rows = con.execute(
@@ -264,6 +302,8 @@ def _send_digest(con, q, now):
     cfg = con.execute("SELECT min_confidence FROM signal_config WHERE question_id=?",
                       (q["id"],)).fetchone()
     minc = (cfg["min_confidence"] if cfg else None) or "unverified"
+    if minc not in CONFIDENCE_RANK:
+        raise ValueError("Invalid signal confidence floor")
     allowed = [k for k, v in CONFIDENCE_RANK.items()
                if v >= CONFIDENCE_RANK.get(minc, 0)]
     sig_rows = con.execute(
@@ -294,6 +334,7 @@ def _send_digest(con, q, now):
     return True
 
 
+@_single_sender
 def run_once():
     now = now_local()
     con = db()
@@ -314,9 +355,7 @@ def run_once():
 
 
 def _send_alert(con, q):
-    to_list = json.loads(q["email_to"] or "[]")
-    if not to_list:
-        return True
+    to_list = _recipients(q)
     marks = ",".join("?" * len(ALERT_TYPES))
     rows = con.execute(
         f"SELECT * FROM signals WHERE question_id=? AND emailed=0 "
@@ -340,6 +379,7 @@ def _send_alert(con, q):
     return True
 
 
+@_single_sender
 def run_alerts():
     """Send high-priority signals on each tick; retain failed batches for retry."""
     con = db()

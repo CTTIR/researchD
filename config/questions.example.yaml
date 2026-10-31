@@ -1,0 +1,55 @@
+# ============================================================
+# RESEARCH QUESTIONS
+# Add a question = add a block here. No code changes needed.
+#
+# Logic: concepts are AND-joined; terms within a concept are
+# OR-joined. `mesh` terms are PubMed-only and merged into the
+# OR block for that concept. `from_days_back` controls the
+# lookback window per run (7 = weekly, 1 = daily).
+# ============================================================
+
+questions:
+
+  - id: glp1_mash
+    label: "GLP-1 receptor agonists for MASH / NASH"
+    concepts:
+      - name: intervention
+        terms:
+          - "GLP-1"
+          - "glucagon-like peptide-1"
+          - semaglutide
+          - liraglutide
+          - tirzepatide
+          - survodutide
+        mesh:
+          - "Glucagon-Like Peptide-1 Receptor Agonists"
+      - name: condition
+        terms:
+          - NASH
+          - MASH
+          - "nonalcoholic steatohepatitis"
+          - "non-alcoholic steatohepatitis"
+          - "metabolic dysfunction-associated steatohepatitis"
+          - MASLD
+          - NAFLD
+        mesh:
+          - "Non-alcoholic Fatty Liver Disease"
+    # Optional: restrict to certain publication types / study designs.
+    # Leave empty for max recall.
+    study_filter: []
+    from_days_back: 7
+    delivery: [file]
+
+  # --- TEMPLATE: copy, rename id, edit ---
+  # - id: my_question
+  #   label: "Human-readable label"
+  #   concepts:
+  #     - name: population
+  #       terms: ["term a", "synonym b"]
+  #       mesh: ["Some MeSH Heading"]
+  #     - name: intervention
+  #       terms: ["drug x", "class y"]
+  #       mesh: []
+  #   study_filter: ["randomized controlled trial", "systematic review"]
+  #   from_days_back: 7
+  #   delivery: [file]

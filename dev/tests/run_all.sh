@@ -31,6 +31,7 @@ run "classifier edge cases"      dev/tests/Rrun.sh dev/tests/classify_table.R
 run "dedup and ranking"          dev/tests/Rrun.sh dev/tests/dedup_rank.R
 run "fetch plumbing + decrypt"   dev/tests/Rrun.sh dev/tests/fetch_plumbing.R
 run "engine hardening"          dev/tests/Rrun.sh dev/tests/hardening_engine.R
+run "engine release regressions" dev/tests/Rrun.sh dev/tests/hardening_engine_release.R
 run "Zotero failure and retry"  dev/tests/Rrun.sh dev/tests/hardening_delivery.R
 run "nullable delivery metadata" dev/tests/Rrun.sh dev/tests/hardening_engine_delivery.R
 
@@ -49,8 +50,10 @@ run "integration: all services"  $PY dev/tests/integration_phase6.py
 run "security: adversarial"      $PY dev/tests/security_phase7.py
 run "ops: restart, backup, prune" $PY dev/tests/ops_phase8.py
 run "web security regressions"   $PY dev/tests/hardening_web.py
+run "real HTTP auth and privacy" $PY dev/tests/hardening_web_http.py
 run "scheduler regressions"      $PY dev/tests/hardening_scheduler.py
 run "dashboard DOM"              node dev/tests/hardening_web_dom.js
+run "safe first-use setup"      $PY dev/tests/first_use.py
 run "cron environment handoff"   $PY dev/tests/hardening_cron.py
 run "real pipeline entrypoint"   $PY dev/tests/hardening_entrypoint.py
 run "delivery-aware retention"   $PY dev/tests/hardening_retention.py

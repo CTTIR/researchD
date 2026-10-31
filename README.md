@@ -11,7 +11,7 @@ the token-authenticated REST API.
 **Development software for academic research.** Search coverage, source access
 and classification accuracy vary. Results need human review; this is not a
 validated systematic-review search or a clinical decision system. The
-[maintenance record](docs/maintenance-2026-10-30.md) documents the audit,
+[release record](docs/release-2026-10-31.md) documents the audit,
 repairs, verification evidence and remaining release work.
 
 ## Sources and coverage
@@ -59,36 +59,23 @@ records without DOIs to appear once again.
 The services share `db/pipeline.sqlite` using WAL and a busy timeout. The
 Compose stack binds `db/`, `digests/` and `config/` to the host. Keep the
 SQLite database on local storage shared by these processes, on one host.
-Concurrent pipeline runs are locked to avoid duplicate delivery. Multi-host
+Concurrent pipeline runs and scheduler ticks are separately locked against the
+same database to avoid overlapping delivery. Multi-host
 deployment requires a different database and coordination design.
 
 ## First run on this machine
 
 Prerequisites: Docker Engine/Desktop with Compose v2, Git, and Python 3 for
 one-time secret generation. The pipeline image uses R 4.4.1; the web and
-scheduler images use Python 3.12. Native development supports R 4.4+ and
-Python 3.12+.
+scheduler images use Python 3.12. Native server development on Linux/macOS
+supports R 4.4+ and Python 3.12+; Windows hosts should use Linux containers.
 
 ```bash
 git clone https://github.com/CTTIR/researchD.git
 cd researchD
-python3 - <<'PYENV'
-import base64, os, pathlib, re, secrets
-values = {
-    "APP_SECRET_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
-    "API_TOKEN": secrets.token_hex(32),
-    "WEB_BIND": "127.0.0.1",
-    "BASE_URL": "http://127.0.0.1:8000",
-    "SECURE_COOKIE": "0",
-}
-text = pathlib.Path(".env.example").read_text()
-for name, value in values.items():
-    text = re.sub(rf"^{name}=.*$", f"{name}={value}", text, flags=re.MULTILINE)
-# Refuse to replace an existing environment or its encryption key.
-fd = os.open(".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, "w") as stream:
-    stream.write(text)
-PYENV
+python3 scripts/setup.py
+docker compose up -d --build --wait
+curl --fail http://127.0.0.1:8000/healthz
 ```
 
 Back up **`APP_SECRET_KEY` separately from the database**. Changing or losing
@@ -97,35 +84,34 @@ question as failed; restore the matching key or replace its stored credentials.
 Keep `.env` private and
 out of version control.
 
-1. Edit `.env` and `config/settings.yaml` with a real contact email. Configure
-   SMTP and Zotero only if you intend to use them. For a first local run,
-   choose file delivery only and leave email recipients empty.
-2. Review `config/questions.yaml`, which seeds questions only when the
-   question table is empty. Its example enables email and Zotero delivery;
-   change `delivery` to `[file]` unless those services are configured.
-3. Start the services:
+The setup command creates a private `.env`, refuses to overwrite an existing
+one, and leaves external delivery disabled. Use `--port 18084 --project researchd-test`
+for a separate stack, or `--base-url https://feeds.example.org` for an HTTPS
+origin behind your reverse proxy.
 
-   ```bash
-   docker compose up -d --build
-   curl --fail http://127.0.0.1:8000/healthz
-   ```
-
-4. Open <http://127.0.0.1:8000/setup>, create the administrator, log in, and
+1. Edit `.env` and `config/settings.yaml` with a real contact email before
+   retrieving sources. Configure SMTP and Zotero when you intend to use them.
+2. Open <http://127.0.0.1:8000/setup>, create the administrator, log in, and
    complete **2FA enrollment**. Scan the QR code and save the recovery codes.
-   Create or edit a question, review its source toggles, lookback and delivery
-   choices, and add any required source keys.
-5. Fetch explicitly and inspect the outcome:
+   Each successful authenticator code can be used once. If you sign in again
+   immediately after enrollment, wait for a new code. Recovery codes are also single use. Keep the enrolled
+   authenticator: self-service replacement is not yet available.
+3. Create a question in the dashboard, reviewing source toggles, lookback,
+   delivery choices and required source keys. New installations have no active
+   questions. For YAML seeding, review `config/questions.example.yaml` and copy
+   it to `config/questions.yaml` before the first engine run; seeding occurs
+   only while the question table is empty. The example uses file delivery.
+4. Fetch explicitly and inspect the outcome:
 
    ```bash
    docker compose exec pipeline Rscript R/run_all.R
    docker compose logs --tail=100 pipeline web scheduler
    ```
 
-   A single question can be selected with
-   `docker compose exec pipeline Rscript R/run_all.R glp1_mash`. The first
-   run searches the entire lookback window and may be slow. Inspect source
-   health as well as the resulting records; zero results alone do not prove
-   that every source worked.
+   Select one question with `docker compose exec pipeline Rscript R/run_all.R YOUR_QUESTION_ID`.
+   The first run searches the entire lookback window and may be slow. Inspect
+   source health as well as records; zero results alone do not prove that every
+   source worked. With no enabled questions, the engine records a healthy idle run.
 
 The local HTTP settings above work only on this machine. For remote access,
 configure TLS as described below before exposing the service. Do not enable
@@ -140,7 +126,7 @@ library(researchR)
 # Set RESEARCHR_TOKEN in your private R environment to the .env API_TOKEN.
 con <- rr_connect("http://127.0.0.1:8000", token = Sys.getenv("RESEARCHR_TOKEN"))
 rr_questions(con)
-rr_records(con, "glp1_mash")
+rr_records(con, "YOUR_QUESTION_ID")
 rr_source_health(con)
 ```
 
@@ -181,7 +167,8 @@ Email has its own per-question `email_cron`, interpreted in `TZ`, and
 recipient list. The scheduler checks every `CHECK_INTERVAL` seconds. Instant
 alerts send eligible high-priority signals on a subsequent tick. Records are
 marked emailed only after successful delivery. A partial SMTP recipient
-failure can cause already-accepted recipients to receive a duplicate on
+failure, or a crash after SMTP acceptance but before the SQLite acknowledgment,
+can cause already-accepted recipients to receive a duplicate on
 retry; there is no per-recipient delivery ledger. Unknown signal types remain
 visible in digests instead of being silently dropped.
 
@@ -312,7 +299,8 @@ successes. It may incur provider quota usage and requires the full adapter
 dependencies and any source credentials.
 
 GitHub Actions defines the offline/native client integration and a separate
-Compose build/start smoke test. The workflow can be dispatched with a
+Compose build/start smoke test, including file export, RSS and an isolated SMTP
+socket that captures a synthetic message without forwarding it. The workflow can be dispatched with a
 `client_ref` to test a matching researchR branch or commit; ordinary runs use
 its main branch. Configuring this workflow does not establish that a hosted
 run or a Docker build has succeeded; consult the maintenance record and

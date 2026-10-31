@@ -9,6 +9,7 @@
   txt <- tolower(paste(recs$title, recs$abstract))
   all_terms <- unique(unlist(lapply(q$concepts, function(c) c(c$terms, c$mesh))))
   all_terms <- tolower(all_terms)
+  all_terms <- all_terms[!is.na(all_terms) & nzchar(trimws(all_terms))]
   vapply(txt, function(t) {
     sum(vapply(all_terms, function(term) grepl(term, t, fixed = TRUE), logical(1)))
   }, numeric(1)) / max(length(all_terms), 1)
@@ -26,6 +27,7 @@ rank_records <- function(recs, q, settings) {
           else max(as.numeric(Sys.Date() - oldest), 1)
   recency <- 1 - (as.numeric(Sys.Date() - recs$pub_date) / span)
   recency[!is.finite(recency)] <- 0
+  recency <- pmax(0, pmin(1, recency))
   # source priority normalized
   sp <- vapply(recs$source, function(s) w$source_priority[[s]] %||% 0, numeric(1))
   sp <- sp / max(max(unlist(w$source_priority)), 1)

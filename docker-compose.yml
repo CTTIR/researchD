@@ -16,8 +16,7 @@ services:
       dockerfile: Dockerfile
       args:
         TZ: ${TZ:-Europe/Berlin}
-    image: research-pipeline:latest
-    container_name: research-pipeline
+    image: ${COMPOSE_PROJECT_NAME:-researchd}-pipeline:local
     restart: unless-stopped
     environment:
       CRON_SCHEDULE: "${CRON_SCHEDULE:-0 6 * * *}"            # full run (both tracks)
@@ -38,8 +37,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
-    image: research-web:latest
-    container_name: research-web
+    image: ${COMPOSE_PROJECT_NAME:-researchd}-web:local
     restart: unless-stopped
     environment:
       DB_PATH: "/app/db/pipeline.sqlite"
@@ -58,15 +56,18 @@ services:
       - ./db:/app/db
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8000}:8000"
-    depends_on:
-      - pipeline
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read()"]
+      interval: 10s
+      timeout: 6s
+      start_period: 10s
+      retries: 6
 
   scheduler:
     build:
       context: .
       dockerfile: Dockerfile.scheduler
-    image: research-scheduler:latest
-    container_name: research-scheduler
+    image: ${COMPOSE_PROJECT_NAME:-researchd}-scheduler:local
     restart: unless-stopped
     environment:
       DB_PATH: "/app/db/pipeline.sqlite"
@@ -81,7 +82,8 @@ services:
     volumes:
       - ./db:/app/db
     depends_on:
-      - web
+      web:
+        condition: service_healthy
 
 # Put `web` behind a reverse proxy (Caddy/Nginx/Traefik) for TLS + a domain.
 # Feeds are intentionally open; the dashboard requires login + TOTP 2FA.

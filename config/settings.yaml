@@ -69,7 +69,7 @@ ranking:
 # For your own SMTP server: 587 = STARTTLS (tls=true), 465 = implicit SSL
 # (ssl=true). Set whichever your server uses.
 email:
-  enabled: true
+  enabled: false
   to: "you@example.com"
   from: "pipeline@example.com"
   smtp_host: "mail.yourdomain.com"
@@ -82,7 +82,7 @@ email:
 
 # ---- Zotero push (via Web API; needs key + library id) ----
 zotero:
-  enabled: true
+  enabled: false
   library_type: "user"        # "user" or "group"
   library_id: ""              # numeric, from zotero.org/settings/keys
   api_key_env: "ZOTERO_KEY"   # store key in env var

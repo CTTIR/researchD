@@ -137,7 +137,9 @@ check("consuming removes exactly one code", len(json.loads(newjson)) == len(stor
 print("\n3. secret handling")
 c2 = client()
 c2.post("/login", data={"username": "admin", "password": "correct-horse-battery"})
-c2.post("/2fa", data={"code": pyotp.TOTP(secret).now()})
+# Enrollment consumed its OTP. Authenticate this new session using a genuine
+# unused recovery code rather than relying on replay within the same step.
+c2.post("/2fa", data={"code": CODES[0]})
 Q = {"id": "sec_q", "label": "Secret question",
      "concepts": [{"name": "a", "terms": ["alpha"], "mesh": []}],
      "api_keys": {"pubmed": SECRET_KEY_VALUE}}

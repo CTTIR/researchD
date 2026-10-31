@@ -28,4 +28,5 @@ dev/ACCESS_AUDIT.md
 **/*.pyc
 db/*.sqlite*
 db/*.pipeline.lock
+db/*.scheduler.lock
 db/*.replaced-*

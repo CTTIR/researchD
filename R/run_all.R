@@ -51,7 +51,6 @@ seed_questions_from_yaml(con, "config/questions.yaml")  # no-op if DB already po
 sel <- commandArgs(trailingOnly = TRUE)
 questions <- load_questions_db(con, selected_ids = sel)
 load_errors <- attr(questions, "load_errors") %||% list()
-if (length(questions) == 0 && !length(load_errors)) stop("No matching enabled questions to run.")
 
 run_date <- format(Sys.Date(), "%Y-%m-%d")
 per_question <- list()
@@ -64,6 +63,15 @@ per_question <- list()
 #   lit           : literature only
 run_mode <- Sys.getenv("RUN_MODE", "all")
 if (!run_mode %in% c("all", "lit", "signals")) stop("RUN_MODE must be all, lit, or signals")
+if (!length(questions) && !length(load_errors)) {
+  if (length(sel)) stop("No matching enabled questions to run.")
+  heartbeat(con, "pipeline", ok = TRUE,
+            detail = paste0("mode=", run_mode, "; idle: no enabled questions"))
+  DBI::dbDisconnect(con)
+  filelock::unlock(pipeline_lock)
+  message("Idle: no enabled questions. Create a question in the dashboard or researchR.")
+  quit(status = 0L)
+}
 do_lit <- run_mode %in% c("all", "lit")
 do_sig <- run_mode %in% c("all", "signals")
 

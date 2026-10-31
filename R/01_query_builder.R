@@ -18,6 +18,18 @@
   paste0("(", paste(terms, collapse = sep), ")")
 }
 
+# Sources without a MeSH field can still search a heading as ordinary text.
+# Keep every concept represented when a question supplies only that heading.
+.free_text_terms <- function(con) {
+  terms <- con$terms %||% character(0)
+  terms <- terms[!is.na(terms) & nzchar(trimws(terms))]
+  if (!length(terms)) {
+    terms <- con$mesh %||% character(0)
+    terms <- terms[!is.na(terms) & nzchar(trimws(terms))]
+  }
+  unique(terms)
+}
+
 # --- PubMed (E-utilities) -------------------------------------
 # Free text searched in [tiab] (title/abstract); MeSH in [MeSH Terms].
 build_pubmed <- function(q, from_days_back = NULL) {
@@ -63,7 +75,7 @@ build_openalex <- function(q) {
 # v2 API: query.term with Essie expression syntax (AND/OR supported).
 build_clinicaltrials <- function(q) {
   concept_blocks <- vapply(q$concepts, function(con) {
-    all_terms <- unique(c(con$terms))  # mesh headings less useful here
+    all_terms <- .free_text_terms(con)
     .or_join(.quote_if_phrase(all_terms))
   }, character(1))
   paste(concept_blocks, collapse = " AND ")
@@ -75,7 +87,7 @@ build_clinicaltrials <- function(q) {
 build_biorxiv_matcher <- function(q) {
   # Returns a function: given title+abstract text, TRUE if all concepts present.
   concept_patterns <- lapply(q$concepts, function(con) {
-    terms <- unique(c(con$terms))
+    terms <- .free_text_terms(con)
     paste0("\\b", gsub("([.|()\\^{}+$*?\\[\\]])", "\\\\\\1", terms), "\\b",
            collapse = "|")
   })
@@ -100,7 +112,7 @@ build_semanticscholar <- function(q) {
 # helps catch the very newest journal articles. Query is a plain string.
 build_crossref <- function(q) {
   # one bibliographic query string; relevance-ranked, then concept-filtered
-  paste(unlist(lapply(q$concepts, function(con) con$terms)), collapse = " ")
+  paste(unlist(lapply(q$concepts, .free_text_terms)), collapse = " ")
 }
 
 # --- master dispatcher ----------------------------------------

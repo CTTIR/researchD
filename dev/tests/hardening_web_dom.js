@@ -36,9 +36,13 @@ const document={
 const question={id:'ordinary',label:`Study's <img src=x onerror=alert(1)>`,from_days_back:7,enabled:true,
   concepts:[{name:'<b>topic</b>',terms:['</textarea><script>bad</script>'],mesh:[]}],
   sources:{},api_key_present:{},delivery:['file'],email_enabled:false,email_to:[]};
-let failSettings=false, writes=0;
+let failSettings=false, writes=0, releaseQuestion, holdQuestion=false;
+const posted=[];
 const fetch=async(url,options)=>{
-  if(options?.method==='POST') writes++;
+  if(options?.method==='POST') {
+    writes++; posted.push({url,body:JSON.parse(options.body)});
+    if(url==='/api/questions' && holdQuestion) await new Promise(resolve=>{releaseQuestion=resolve;});
+  }
   if(url==='/api/questions') return {ok:true,json:async()=>[question]};
   if(url==='/api/source_health') return {ok:true,json:async()=>({sources:[{source:'<img src=x>',track:'lit',stale:false}]})};
   if(url.startsWith('/api/signal_config/')) return {ok:!failSettings,json:async()=>({sources:{},feed_categories:{},scrape_targets:[],api_key_present:{}})};
@@ -69,5 +73,17 @@ const settle=()=>new Promise(resolve=>setImmediate(resolve));
   await context.save();
   assert.equal(writes,0,'A failed signal-settings load must block saving default settings over existing data');
   assert.match(roots.get('msg').textContent,/reload/);
-  console.log('Dashboard edit, hostile text, feed URLs, and failed-settings-save regressions passed');
+  failSettings=false;
+  context.edit(question); await settle();
+  roots.get('sigMinConf').value='authoritative';
+  holdQuestion=true;
+  const saving=context.save(); await settle();
+  assert.equal(typeof releaseQuestion,'function');
+  roots.get('sigMinConf').value='unverified';
+  roots.get('sigInstant').checked=true;
+  releaseQuestion(); await saving;
+  const signalPost=posted.find(entry=>entry.url==='/api/signal_config/ordinary');
+  assert.equal(signalPost.body.min_confidence,'authoritative');
+  assert.equal(signalPost.body.instant_alerts,false);
+  console.log('Dashboard edit, hostile text, failed settings load, and save snapshot regressions passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -76,56 +76,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Prepare isolated configuration and database
+      - name: Prepare isolated first-use configuration
         run: |
+          python3 scripts/setup.py --project researchd-ci
           python3 - <<'PY'
-          import base64, json, os, pathlib, secrets, sqlite3
-          values = {
-              "APP_SECRET_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
-              "API_TOKEN": secrets.token_hex(32),
-              "WEB_BIND": "127.0.0.1", "WEB_PORT": "8000",
-              "BASE_URL": "http://127.0.0.1:8000", "SECURE_COOKIE": "0",
-              "RUN_ON_START": "0", "SMTP_HOST": "", "EMAIL_PW": "",
-              # No scheduled retrieval can run on this impossible calendar date.
-              "CRON_SCHEDULE": "0 0 31 2 *", "CRON_FAST_SCHEDULE": "0 0 31 2 *",
-          }
-          fd = os.open(".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-          with os.fdopen(fd, "w") as stream:
-              stream.write("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
-          sources = dict.fromkeys(("pubmed", "europepmc", "openalex", "crossref",
-                                   "semanticscholar", "clinicaltrials", "biorxiv"), False)
-          with sqlite3.connect("db/pipeline.sqlite") as con:
-              con.executescript(pathlib.Path("db/schema.sql").read_text())
-              con.execute("INSERT INTO questions(id,label,sources,delivery,email_enabled) VALUES(?,?,?,?,0)",
-                          ("ci", "Synthetic startup question", json.dumps(sources), "[]"))
-              con.execute("INSERT INTO concepts(question_id,name,position,terms,mesh) VALUES(?,?,?,?,?)",
-                          ("ci", "test", 0, '["synthetic"]', "[]"))
+          from pathlib import Path
+          import re
+          path = Path(".env")
+          text = path.read_text()
+          for key in ("CRON_SCHEDULE", "CRON_FAST_SCHEDULE"):
+              text = re.sub(rf"^{key}=.*$", f"{key}=0 0 31 2 *", text, flags=re.MULTILINE)
+          path.write_text(text)
           PY
       - name: Build and start all services
         run: |
           docker compose config --quiet
           docker compose build
-          docker compose up -d
-          for _ in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:8000/healthz; then break; fi
-            sleep 2
-          done
+          docker compose up -d --wait --wait-timeout 120
           curl --fail --silent http://127.0.0.1:8000/healthz
-      - name: Run the container engine without external retrieval or delivery
+      - name: Exercise idle startup, cron environment, file delivery, API, RSS and SMTP
         run: |
-          docker compose exec -T pipeline Rscript R/run_all.R ci
-          python3 - <<'PY'
-          import json, pathlib, sqlite3, urllib.request
-          env = dict(line.split("=", 1) for line in pathlib.Path(".env").read_text().splitlines())
-          req = urllib.request.Request("http://127.0.0.1:8000/api/v1/questions",
-                                       headers={"Authorization": "Bearer " + env["API_TOKEN"]})
-          with urllib.request.urlopen(req, timeout=10) as response:
-              data = json.load(response)
-          assert data[0]["id"] == "ci", data
-          with sqlite3.connect("db/pipeline.sqlite") as con:
-              assert con.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 0
-              assert con.execute("SELECT last_ok FROM service_heartbeat WHERE service='pipeline'").fetchone()[0]
-          PY
+          docker compose exec -T pipeline Rscript R/run_all.R
+          python3 dev/tests/compose_smoke.py
       - name: Show service state
         if: always()
         run: |

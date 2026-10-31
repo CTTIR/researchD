@@ -9,6 +9,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -118,6 +120,57 @@ class SchedulerRegression(unittest.TestCase):
             for table in ("records", "signals"):
                 pending = con.execute(f"SELECT question_id FROM {table} WHERE emailed=0").fetchall()
                 self.assertEqual(pending, [("broken",)])
+            con.close()
+
+    def test_overlapping_senders_do_not_email_the_same_batch_twice(self):
+        with tempfile.TemporaryDirectory(prefix="researchd-scheduler-") as tmp:
+            path = str(Path(tmp) / "state.sqlite")
+            con = sqlite3.connect(path)
+            con.executescript((ROOT / "db/schema.sql").read_text())
+            con.execute("INSERT INTO questions(id,label,email_enabled,email_cron,email_to) "
+                        "VALUES('q','Q',1,'0 0 * * *','[\"reader@example.invalid\"]')")
+            con.execute("INSERT INTO records(dedup_key,question_id,title,study_type) VALUES('r','q','Paper','rct')")
+            con.commit(); con.close()
+            sending, release = Event(), Event()
+            def send(*args):
+                sending.set()
+                if not release.wait(5): raise RuntimeError("Test sender timed out")
+                return True
+            with patch.multiple(scheduler, DB_PATH=path), \
+                    patch.object(scheduler, "send_email", side_effect=send) as smtp, \
+                    patch.object(scheduler, "now_local", return_value=datetime(2026,10,31,12,tzinfo=timezone.utc)), \
+                    ThreadPoolExecutor(2) as pool:
+                first = pool.submit(scheduler.run_once)
+                self.assertTrue(sending.wait(2))
+                try:
+                    self.assertFalse(pool.submit(scheduler.run_once).result(timeout=2))
+                    self.assertFalse(pool.submit(scheduler.run_alerts).result(timeout=2))
+                finally:
+                    release.set()
+                self.assertTrue(first.result(timeout=2))
+                self.assertTrue(scheduler.run_once())
+                self.assertEqual(smtp.call_count, 1)
+
+    def test_invalid_persisted_email_settings_are_reported_as_failure(self):
+        with tempfile.TemporaryDirectory(prefix="researchd-scheduler-") as tmp:
+            path = str(Path(tmp) / "state.sqlite")
+            con = sqlite3.connect(path)
+            con.executescript((ROOT / "db/schema.sql").read_text())
+            con.execute("INSERT INTO questions(id,label,email_enabled,email_cron,email_to) "
+                        "VALUES('q','Q',1,'0 0 * * *','[\"reader@example.invalid\"]')")
+            con.execute("INSERT INTO records(dedup_key,question_id,title,study_type) VALUES('r','q','Paper','rct')")
+            con.commit()
+            cases = [("email_cron", "invalid"), ("email_to", '"reader@example.invalid"'),
+                     ("email_to", "[]"), ("email_to", '["recipient"]'), ("digest_mode", "typo")]
+            with patch.multiple(scheduler, DB_PATH=path), patch.object(scheduler, "send_email") as smtp:
+                for field, value in cases:
+                    con.execute("UPDATE questions SET email_cron='0 0 * * *', "
+                                "email_to='[\"reader@example.invalid\"]',digest_mode='all'")
+                    con.execute(f"UPDATE questions SET {field}=?", (value,)); con.commit()
+                    with self.subTest(field=field, value=value):
+                        self.assertFalse(scheduler.run_once())
+                self.assertEqual(smtp.call_count, 0)
+            self.assertEqual(con.execute("SELECT emailed FROM records").fetchone()[0], 0)
             con.close()
 
 

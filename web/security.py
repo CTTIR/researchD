@@ -97,6 +97,25 @@ def verify_totp(secret: str, code: str) -> bool:
     # valid_window=1 tolerates ~30s clock drift each way
     return pyotp.TOTP(secret).verify(code.strip().replace(" ", ""), valid_window=1)
 
+
+def unused_totp_step(secret: str, code: str, last_step: int = -1):
+    """Return an unused time step within the allowed drift, or None.
+
+    The caller must persist it in the same transaction that authenticates the
+    session. Enrollment consumes its confirmation code as well (RFC 6238).
+    """
+    if not secret or not code:
+        return None
+    code = code.strip().replace(" ", "")
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
+        return None
+    totp = pyotp.TOTP(secret)
+    current = int(time.time()) // totp.interval
+    matches = [step for step in range(max(0, current - 1), current + 2)
+               if pyotp.utils.strings_equal(totp.generate_otp(step), code)]
+    step = max(matches) if matches else None
+    return step if step is not None and step > (last_step if last_step is not None else -1) else None
+
 # ---- sessions ------------------------------------------------
 def new_session_token() -> str:
     return secrets.token_urlsafe(32)

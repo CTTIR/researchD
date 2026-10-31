@@ -134,17 +134,26 @@ load_signal_config <- function(con, question_id) {
     return(list(sources = list(), min_confidence = "unverified",
                 scrape_targets = list(), api_keys = list()))
   }
-  keys_enc <- .read_config_json(row$api_keys_enc, "signal_config.api_keys_enc", "{}")
+  keys_enc <- .config_map(.read_config_json(row$api_keys_enc, "signal_config.api_keys_enc", "{}"),
+    "signal_config.api_keys_enc", kind = "character")
+  sources <- .config_map(.read_config_json(row$sources, "signal_config.sources", "{}"),
+    "signal_config.sources", allowed = c("sec_edgar", "nih_reporter", "openfda", "trials",
+      "patentsview", "epo_ops", "feeds", "cortellis", "citeline"))
+  categories <- .config_map(.read_config_json(row$feed_categories, "signal_config.feed_categories", "{}"),
+    "signal_config.feed_categories", allowed = c("literature_alert", "institution", "aggregator",
+      "trade_press", "news", "ir_alert", "conference"))
+  targets <- .read_config_json(row$scrape_targets, "signal_config.scrape_targets", "[]", simplify = FALSE)
+  if (!is.list(targets) || (!is.null(names(targets)) && length(targets)) ||
+      !all(vapply(targets, is.list, logical(1))))
+    stop("Invalid array in signal_config.scrape_targets", call. = FALSE)
+  confidence <- row$min_confidence %||% "unverified"
+  if (!confidence %in% c("unverified", "reported", "authoritative"))
+    stop("Invalid signal_config.min_confidence", call. = FALSE)
   list(
-    sources = tryCatch(jsonlite::fromJSON(row$sources %||% "{}"),
-                       error = function(e) list()),
-    min_confidence = row$min_confidence %||% "unverified",
-    feed_categories = tryCatch(jsonlite::fromJSON(row$feed_categories %||% "{}"),
-                               error = function(e) list()),
-    scrape_targets = tryCatch({
-      st <- jsonlite::fromJSON(row$scrape_targets %||% "[]", simplifyDataFrame = FALSE)
-      if (is.null(st)) list() else st
-    }, error = function(e) list()),
+    sources = sources,
+    min_confidence = confidence,
+    feed_categories = categories,
+    scrape_targets = targets,
     api_keys = lapply(keys_enc, .decrypt_key)   # from 07_db_questions.R
   )
 }

@@ -174,6 +174,7 @@ CREATE TABLE IF NOT EXISTS auth (
   pw_hash       TEXT NOT NULL,             -- bcrypt
   totp_secret   TEXT,                      -- base32; null until 2FA enrolled
   totp_enabled  INTEGER DEFAULT 0,
+  totp_last_step INTEGER DEFAULT -1,       -- successful OTP step; blocks replay
   recovery_codes TEXT DEFAULT '[]',        -- JSON array of bcrypt-hashed codes
   created_at    TEXT DEFAULT (datetime('now'))
 );

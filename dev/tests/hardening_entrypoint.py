@@ -31,6 +31,21 @@ zotero: {enabled: false}
 ''')
     con = sqlite3.connect(target/'db/pipeline.sqlite')
     con.executescript((target/'db/schema.sql').read_text())
+    con.close()
+    env = dict(os.environ,R_LIBS=os.environ.get('R_LIBS',str(ROOT/'dev/state/tmp/Rlib')),RUN_MODE='lit',
+               PATH=str(Path(sys.executable).parent)+os.pathsep+os.environ.get('PATH',''))
+    command = ['Rscript','--vanilla',str(target/'R/run_all.R')]
+    # A fresh installation is healthy while waiting for its first question.
+    (target/'config/questions.yaml').write_text('questions: []\n')
+    idle = subprocess.run(command,cwd=target,env=env,capture_output=True,text=True,timeout=45)
+    assert idle.returncode == 0 and 'Idle: no enabled questions' in idle.stderr, idle.stdout+idle.stderr
+    con = sqlite3.connect(target/'db/pipeline.sqlite')
+    hb = con.execute("SELECT last_ok,last_detail,last_error FROM service_heartbeat WHERE service='pipeline'").fetchone()
+    assert hb[0] and 'idle: no enabled questions' in hb[1] and not hb[2], hb
+    con.close()
+    missing = subprocess.run(command+['missing'],cwd=target,env=env,capture_output=True,text=True,timeout=45)
+    assert missing.returncode != 0 and 'No matching enabled questions' in missing.stderr
+    con = sqlite3.connect(target/'db/pipeline.sqlite')
     con.execute("INSERT INTO questions(id,label,delivery) VALUES('test','Synthetic','[\"file\"]')")
     con.execute("INSERT INTO concepts(question_id,name,terms) VALUES('test','topic','[\"alpha\"]')")
     con.execute("INSERT INTO records(dedup_key,question_id,source,title,study_type,score)"

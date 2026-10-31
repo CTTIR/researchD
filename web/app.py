@@ -27,11 +27,13 @@ import os, json, sqlite3, secrets as pysecrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from email.utils import format_datetime
-from xml.sax.saxutils import escape, quoteattr
+from xml.sax.saxutils import escape as xml_escape, quoteattr
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, Form, Cookie
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
 from typing import Literal
@@ -60,15 +62,61 @@ BASE_DIR = Path(__file__).parent
 app = FastAPI(title="Research Feed Service")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request, exc):
+    # Pydantic includes rejected input and context, which can contain API keys
+    # or login credentials. Keep useful field paths/types without body echoes.
+    detail = []
+    for error in exc.errors():
+        location = list(error["loc"])
+        for index in range(1, len(location)):
+            if location[index - 1] in ("api_keys", "sources", "feed_categories"):
+                location[index] = "<key>"
+        detail.append({"loc": location, "type": error["type"], "msg": error["msg"]})
+    return JSONResponse(status_code=422, content={"detail": detail})
+
 @app.middleware("http")
 async def response_security_headers(request, call_next):
-    response = await call_next(request)
+    path = request.url.path
+    machine_route = path.startswith("/api/v1/") or path == "/api/ingest"
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not machine_route and not _same_origin(request):
+        response = PlainTextResponse("Cross-origin browser request rejected", status_code=403)
+    else:
+        response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     if request.url.path == "/" or request.url.path.startswith(("/api/", "/setup", "/login", "/2fa")):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _origin(value):
+    try:
+        url = urlsplit(value)
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+            return None
+        return (url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80))
+    except ValueError:
+        return None
+
+
+def _same_origin(request):
+    """Protect browser forms and cookie APIs; bearer APIs do not use cookies.
+
+    Origin is supplied on browser POSTs, including first-run setup and login.
+    Referer/Fetch Metadata cover older browsers. Headerless non-browser callers
+    remain supported; untrusted proxy headers are never used as the authority.
+    """
+    expected = _origin(BASE_URL or str(request.base_url))
+    source = request.headers.get("origin")
+    if source is None:
+        source = request.headers.get("referer")
+    if source is not None and (expected is None or _origin(source) != expected):
+        return False
+    site = request.headers.get("sec-fetch-site")
+    return site not in ("cross-site", "same-site")
 
 
 _jenv = jinja2.Environment(
@@ -105,6 +153,7 @@ _MIGRATIONS = [
     ("signal_config", "instant_alerts", "INTEGER DEFAULT 0"),
     ("records", "oa_url", "TEXT"),
     ("records", "provenance", "TEXT DEFAULT '[]'"),
+    ("auth", "totp_last_step", "INTEGER DEFAULT -1"),
 ]
 def _migrate(con):
     for table, col, coldef in _MIGRATIONS:
@@ -188,9 +237,35 @@ STUDY_LABELS = {
 
 
 # ================= PUBLIC: RSS FEEDS ==========================
+def _xml_chars(value):
+    # XML 1.0 forbids control characters and isolated UTF-16 surrogates even
+    # when entity-escaped. Preserve source data in SQLite; clean only output.
+    return "".join(c for c in str(value or "") if c in "\t\n\r" or
+                   0x20 <= ord(c) <= 0xD7FF or 0xE000 <= ord(c) <= 0xFFFD or
+                   0x10000 <= ord(c) <= 0x10FFFF)
+
+
+def escape(value):
+    return xml_escape(_xml_chars(value))
+
+
+def _feed_link(value):
+    return escape(value) if valid_http_url(value) else ""
+
+
+def _feed_date(value):
+    try:
+        stamp = datetime.fromisoformat(value or "")
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return format_datetime(stamp.astimezone(timezone.utc))
+    except (ValueError, TypeError):
+        return format_datetime(datetime.now(timezone.utc))
+
+
 def _rss_item(r) -> str:
     title = escape(r["title"] or "(untitled)")
-    link = escape(r["url"] or "")
+    link = _feed_link(r["url"])
     guid = escape(r["dedup_key"])
     bits = []
     if r["authors"]: bits.append(escape(r["authors"][:300]))
@@ -202,7 +277,9 @@ def _rss_item(r) -> str:
             bits.append(f'Free full text: {escape(r["oa_url"])}')
     except (KeyError, IndexError):
         pass
-    description = " — ".join(bits)
+    # RSS descriptions contain entity-encoded HTML. Escape its text first,
+    # then escape the resulting HTML for XML so readers cannot execute it.
+    description = escape(" — ".join(bits))
     cats = ""
     if r["study_type"]:
         cats += f"<category>{escape(STUDY_LABELS.get(r['study_type'], r['study_type']))}</category>"
@@ -213,14 +290,10 @@ def _rss_item(r) -> str:
             cats += "<category>preprint</category>"
     except (KeyError, IndexError):
         pass
-    try:
-        dt = datetime.fromisoformat(r["first_seen"]).replace(tzinfo=timezone.utc)
-    except Exception:
-        dt = datetime.now(timezone.utc)
     return (f"<item><title>{title}</title><link>{link}</link>"
             f"<guid isPermaLink='false'>{guid}</guid>"
             f"<description>{description}</description>{cats}"
-            f"<pubDate>{format_datetime(dt)}</pubDate></item>")
+            f"<pubDate>{_feed_date(r['first_seen'])}</pubDate></item>")
 
 def _render_feed(qrow, rows, self_url) -> str:
     title = escape(f"Research feed — {qrow['label']}")
@@ -229,7 +302,7 @@ def _render_feed(qrow, rows, self_url) -> str:
     return (f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<rss version='2.0' xmlns:atom='http://www.w3.org/2005/Atom'>"
             f"<channel><title>{title}</title><link>{escape(self_url)}</link>"
-            f"<atom:link href={quoteattr(self_url)} rel='self' type='application/rss+xml'/>"
+            f"<atom:link href={quoteattr(_xml_chars(self_url))} rel='self' type='application/rss+xml'/>"
             f"<description>Auto-curated literature feed</description>"
             f"<lastBuildDate>{now}</lastBuildDate>{items}</channel></rss>")
 
@@ -283,23 +356,19 @@ CONFIDENCE_RANK = {"unverified": 0, "reported": 1, "authoritative": 2}
 
 def _signal_item(r) -> str:
     title = escape(r["title"] or "(untitled)")
-    link = escape(r["url"] or "")
+    link = _feed_link(r["url"])
     guid = escape(r["dedup_key"])
     bits = []
     if r["org"]: bits.append(escape(r["org"]))
     if r["summary"]: bits.append(escape(r["summary"][:1000]))
-    description = " — ".join(bits)
+    description = escape(" — ".join(bits))
     cats = f"<category>{escape(r['signal_type'])}</category>"
     cats += f"<category>{escape(r['source'])}</category>"
     cats += f"<category>confidence:{escape(r['confidence'] or 'reported')}</category>"
-    try:
-        dt = datetime.fromisoformat((r["first_seen"] or "").replace(" ", "T")).replace(tzinfo=timezone.utc)
-    except Exception:
-        dt = datetime.now(timezone.utc)
     return (f"<item><title>{title}</title><link>{link}</link>"
             f"<guid isPermaLink='false'>{guid}</guid>"
             f"<description>{description}</description>{cats}"
-            f"<pubDate>{format_datetime(dt)}</pubDate></item>")
+            f"<pubDate>{_feed_date(r['first_seen'])}</pubDate></item>")
 
 def _signals_feed_response(qid, request, where="", params=()):
     con = db()
@@ -326,7 +395,7 @@ def _signals_feed_response(qid, request, where="", params=()):
     xml = (f"<?xml version='1.0' encoding='UTF-8'?>"
            f"<rss version='2.0' xmlns:atom='http://www.w3.org/2005/Atom'>"
            f"<channel><title>{title}</title><link>{escape(self_url)}</link>"
-           f"<atom:link href={quoteattr(self_url)} rel='self' type='application/rss+xml'/>"
+           f"<atom:link href={quoteattr(_xml_chars(self_url))} rel='self' type='application/rss+xml'/>"
            f"<description>Early intelligence: trials, grants, filings, patents, press</description>"
            f"<lastBuildDate>{now}</lastBuildDate>{items}</channel></rss>")
     return Response(xml, media_type="application/rss+xml")
@@ -386,7 +455,7 @@ class SignalConfig(BaseModel):
                                      (self.api_keys, SIGNAL_KEY_SOURCES, "signal key")):
             unknown = set(values) - set(known)
             if unknown:
-                raise ValueError(f"Unknown {label}: {', '.join(sorted(unknown))}")
+                raise ValueError(f"Unknown {label}; use a supported name")
         for target in self.scrape_targets:
             url = target.get("url", "")
             if not isinstance(url, str) or not valid_http_url(url):
@@ -436,6 +505,7 @@ def upsert_signal_config(qid: str, cfg: SignalConfig,
             raise HTTPException(422, "scrape_targets entries need url and type rss|html")
     con = db()
     try:
+        con.execute("BEGIN IMMEDIATE")
         if not con.execute("SELECT 1 FROM questions WHERE id=?", (qid,)).fetchone():
             raise HTTPException(404, "No such question")
         # merge keys like the question flow: keep existing, overwrite provided,
@@ -595,7 +665,10 @@ def twofa_submit(request: Request, code: str = Form(...)):
         con.close(); return RedirectResponse("/login", 303)
     if not admin or not admin["totp_enabled"]:
         con.close(); return RedirectResponse("/2fa/enroll", 303)
-    ok = sec.verify_totp(admin["totp_secret"], code)
+    step = sec.unused_totp_step(admin["totp_secret"], code, admin["totp_last_step"])
+    ok = step is not None
+    if ok:
+        con.execute("UPDATE auth SET totp_last_step=? WHERE id=1", (step,))
     if not ok:
         # try recovery code
         good, new_json = sec.consume_recovery_code(code, admin["recovery_codes"])
@@ -604,7 +677,7 @@ def twofa_submit(request: Request, code: str = Form(...)):
             ok = True
     if not ok:
         con.commit(); con.close()
-        return render("twofa.html", error="Invalid code.")
+        return render("twofa.html", error="Invalid code or code already used. Wait for the next authenticator code, or use an unused recovery code.")
     con.execute("UPDATE sessions SET mfa_passed=1 WHERE token=?", (token,))
     con.commit(); con.close()
     return RedirectResponse("/", 303)
@@ -645,14 +718,15 @@ def enroll_submit(request: Request, code: str = Form(...)):
         raise HTTPException(409, "Two-factor authentication is already enrolled")
     if not admin["totp_secret"]:
         con.close(); return RedirectResponse("/2fa/enroll", 303)
-    if not sec.verify_totp(admin["totp_secret"], code):
+    step = sec.unused_totp_step(admin["totp_secret"], code, admin["totp_last_step"])
+    if step is None:
         uri = sec.totp_uri(admin["totp_secret"], admin["username"])
         con.close()
         return render("enroll.html", secret=admin["totp_secret"], uri=uri,
                       error="Code didn't match — check your authenticator.", codes=None)
     codes = sec.gen_recovery_codes()
-    con.execute("UPDATE auth SET totp_enabled=1, recovery_codes=? WHERE id=1",
-                (json.dumps(sec.hash_codes(codes)),))
+    con.execute("UPDATE auth SET totp_enabled=1, recovery_codes=?,totp_last_step=? WHERE id=1",
+                (json.dumps(sec.hash_codes(codes)), step))
     con.execute("UPDATE sessions SET mfa_passed=1 WHERE token=?", (token,))
     con.commit(); con.close()
     # show recovery codes ONCE
@@ -722,7 +796,7 @@ class Question(BaseModel):
                                      (self.api_keys, SOURCES_WITH_KEYS, "API key source")):
             unknown = set(values) - set(known)
             if unknown:
-                raise ValueError(f"Unknown {label}: {', '.join(sorted(unknown))}")
+                raise ValueError(f"Unknown {label}; use a supported name")
         if len(self.email_cron.split()) != 5 or not croniter.is_valid(self.email_cron):
             raise ValueError("email_cron must be a valid five-field cron expression")
         if self.email_enabled and not self.email_to:
@@ -827,6 +901,12 @@ class IngestRecord(BaseModel):
     @classmethod
     def normalize_date(cls, value):
         return _normalize_ingest_date(value)
+
+    @model_validator(mode="after")
+    def require_identity(self):
+        if not _norm_doi(self.doi) and not any(char.isalnum() for char in self.title):
+            raise ValueError("A record needs a DOI or a title containing letters or numbers")
+        return self
 
 VALID_CONFIDENCE = {"authoritative", "reported", "unverified"}
 INGEST_MAX_SCORE = 10.0   # posted scores are capped; R rescoring is canonical
@@ -1010,6 +1090,7 @@ def list_questions(user: str = Depends(require_user)):
 def upsert_question(q: Question, user: str = Depends(require_user)):
     con = db()
     try:
+        con.execute("BEGIN IMMEDIATE")
         # merge API keys: keep existing encrypted keys, overwrite only those
         # the user supplied plaintext for this time (blank = leave as-is).
         existing = con.execute("SELECT api_keys_enc FROM questions WHERE id=?",

@@ -43,7 +43,7 @@ print("\n2. additive migration onto an older deployed DB")
 # Build a DB that predates the migration columns, as a real older install would.
 MIGRATED = [("questions", "digest_mode"), ("questions", "min_score"),
             ("signal_config", "feed_categories"), ("signal_config", "instant_alerts"),
-            ("records", "oa_url"), ("records", "provenance")]
+            ("records", "oa_url"), ("records", "provenance"), ("auth", "totp_last_step")]
 old = SCHEMA
 old = re.sub(r"CREATE TABLE IF NOT EXISTS delivery_outbox \(.*?\n\);\n", "", old, flags=re.S)
 old = re.sub(r"CREATE INDEX IF NOT EXISTS idx_delivery_pending[^\n]*\n", "", old)

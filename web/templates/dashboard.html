@@ -292,7 +292,6 @@ function edit(q){
   fetch(`/api/signal_config/${encodeURIComponent(q.id)}`).then(r=>r.ok?r.json():null).then(sc=>{
     if($("#qid").value!==q.id) return;
     if(!sc) throw new Error("Signal settings unavailable");
-    signalSettingsLoaded=true;
     document.querySelectorAll(".sigsrc").forEach(cb=>cb.checked=!!sc.sources[cb.value]);
     document.querySelectorAll(".sigcat").forEach(cb=>cb.checked=!!sc.feed_categories[cb.value]);
     $("#sigMinConf").value=sc.min_confidence||"unverified";
@@ -301,6 +300,7 @@ function edit(q){
     Object.entries(sc.api_key_present||{}).forEach(([k,v])=>{
       const e=$("#sks-"+k); if(e) e.innerText=v?"(key stored)":"";
     });
+    signalSettingsLoaded=true;
   }).catch(()=>{ $("#msg").textContent="Search loaded; signal settings could not be loaded. Reload before saving."; });
   window.scrollTo(0,0);
 }
@@ -349,18 +349,22 @@ async function save(){
   };
   if(!payload.id||!payload.label||!concepts.length){ $("#msg").innerText="id, label, and ≥1 concept required"; return; }
   if(payload.email_enabled && !payload.email_to.length){ $("#msg").innerText="email on, but no recipients"; return; }
+  // Capture both halves before yielding. The user may open another search
+  // while the first request is in flight; its controls must never leak into
+  // this search's signal configuration.
+  const sigsrc={}; document.querySelectorAll(".sigsrc").forEach(cb=>sigsrc[cb.value]=cb.checked);
+  const sigcat={}; document.querySelectorAll(".sigcat").forEach(cb=>{ if(cb.checked) sigcat[cb.value]=true; });
+  const sigkeys={}; document.querySelectorAll(".sigkey").forEach(i=>{ if(i.value) sigkeys[i.dataset.src]=i.value; });
+  const signalPayload={sources:sigsrc,min_confidence:$("#sigMinConf").value,
+    instant_alerts:$("#sigInstant").checked,feed_categories:sigcat,
+    scrape_targets:targets,api_keys:sigkeys};
   const r=await fetch("/api/questions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
   if(!r.ok) throw new Error(await r.text());
   if(r.ok){
-    const sigsrc={}; document.querySelectorAll(".sigsrc").forEach(cb=>sigsrc[cb.value]=cb.checked);
-    const sigcat={}; document.querySelectorAll(".sigcat").forEach(cb=>{ if(cb.checked) sigcat[cb.value]=true; });
-    const sigkeys={}; document.querySelectorAll(".sigkey").forEach(i=>{ if(i.value) sigkeys[i.dataset.src]=i.value; });
     {
       const sr=await fetch(`/api/signal_config/${encodeURIComponent(payload.id)}`,{method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({sources:sigsrc,min_confidence:$("#sigMinConf").value,
-          instant_alerts:$("#sigInstant").checked,feed_categories:sigcat,
-          scrape_targets:targets,api_keys:sigkeys})});
+        body:JSON.stringify(signalPayload)});
       if(!sr.ok) throw new Error("Search saved, but signal settings failed: "+(await sr.text()));
     }
     $("#msg").textContent="Saved";
