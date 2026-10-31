@@ -30,10 +30,16 @@ sources = dict.fromkeys(('pubmed','europepmc','openalex','semanticscholar','cros
 api('/api/v1/questions', {'id':'release_smoke','label':'Synthetic release smoke',
     'concepts':[{'name':'topic','terms':['synthetic']}], 'sources':sources,
     'delivery':['file'], 'email_enabled':False})
-with sqlite3.connect(database) as con:
-    # Local-only fixture; production ingestion is separately tested over HTTP.
+# Linux bind-mounted SQLite files are owned by the creating container user.
+# Seed from that same environment; do not relax database permissions for a test.
+seed = """
+import sqlite3
+with sqlite3.connect('/app/db/pipeline.sqlite') as con:
     con.execute("INSERT INTO records(dedup_key,question_id,source,title,study_type,score) VALUES('smoke','release_smoke','synthetic','Synthetic <paper> & data','unclassified',1)")
     con.execute("INSERT INTO delivery_outbox(channel,question_id,dedup_key) VALUES('file','release_smoke','smoke')")
+"""
+subprocess.run(['docker','compose','exec','-T','web','python3','-'], input=seed,
+               text=True,cwd=ROOT,check=True,timeout=30)
 for _ in range(2):
     subprocess.run(['docker','compose','exec','-T','pipeline','env','-i',
         'PATH=/usr/local/bin:/usr/bin:/bin','/bin/sh','-c',

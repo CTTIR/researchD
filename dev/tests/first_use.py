@@ -25,6 +25,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert not values['SMTP_HOST'] and not values['EMAIL_PW']
     assert envfile.stat().st_mode & 0o777 == 0o600
     assert (root/'db').is_dir() and (root/'digests').is_dir()
+    assert all((root/name).stat().st_mode & 0o777 == 0o700 for name in ('db','digests'))
     again = subprocess.run(command, capture_output=True, text=True)
     assert again.returncode != 0 and envfile.read_bytes() == original
     envfile.rename(root/'saved.env')

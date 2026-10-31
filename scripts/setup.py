@@ -58,6 +58,7 @@ def main():
         stream.write(text)
     for name in ('db', 'digests'):
         (root / name).mkdir(exist_ok=True)
+        (root / name).chmod(0o700)
     print('Created private .env (0600). Back up APP_SECRET_KEY separately from SQLite.')
     print('External delivery is disabled. Review settings and create your first question in the dashboard.')
     print('Start: docker compose up -d --build --wait')

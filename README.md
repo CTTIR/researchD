@@ -85,7 +85,7 @@ Keep `.env` private and
 out of version control.
 
 The setup command creates a private `.env`, refuses to overwrite an existing
-one, and leaves external delivery disabled. Use `--port 18084 --project researchd-test`
+one, makes `db/` and `digests/` private (0700), and leaves external delivery disabled. Use `--port 18084 --project researchd-test`
 for a separate stack, or `--base-url https://feeds.example.org` for an HTTPS
 origin behind your reverse proxy.
 
@@ -243,6 +243,12 @@ resolve a stale destination before expecting those records to expire. Read the s
 changing these limits. Pruning frees deduplication keys, so a later fetch
 can rediscover a removed record. Verify backup/restore on a disposable copy
 before relying on a deployment.
+
+On Linux, files created in bind mounts can be owned by container root.
+Run host maintenance commands with the required filesystem permissions
+(for example, `sudo scripts/prune.sh db/pipeline.sqlite digests`); do not make
+state directories world-writable. The database includes authentication state
+as well as research records. Keep `db/`, digests and backups private.
 
 Monitor source health (`last_ok`, `last_nonempty`, errors and staleness) and
 service heartbeats in the dashboard or client API. `/healthz` is web liveness,
